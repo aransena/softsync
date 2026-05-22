@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from soft_sync import sync_client, sync_host
-from soft_sync.core import SoftSyncCancelled, SoftSyncError, SoftSyncTimeout
+from softsync import sync_client, sync_host
+from softsync.core import SoftSyncCancelled, SoftSyncError, SoftSyncTimeout
 
 
 def _print_json(payload: Any) -> None:
@@ -15,14 +15,18 @@ def _print_json(payload: Any) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="soft-sync")
+    parser = argparse.ArgumentParser(prog="softsync")
     parser.add_argument(
         "--root",
         type=Path,
         default=None,
-        help="root folder, default /tmp/soft_sync",
+        help="root folder, default /tmp/softsync",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    prepare = subparsers.add_parser("prepare", help="create sync state without starting")
+    prepare.add_argument("sync_id")
+    prepare.add_argument("--reset", action="store_true")
 
     set_start = subparsers.add_parser("set-start", help="arm a named start signal")
     set_start.add_argument("sync_id")
@@ -42,6 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
     start.add_argument("--clock", choices=["monotonic_ns", "unix_ns"], default="monotonic_ns")
     start.add_argument("--overwrite", action="store_true")
     start.add_argument("--reset", action="store_true")
+    start.add_argument("--nonblocking", action="store_true")
 
     wait = subparsers.add_parser("wait", help="watch until a named start signal reaches its target")
     wait.add_argument("sync_id")
@@ -91,6 +96,10 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
     try:
+        if args.command == "prepare":
+            _print_json(sync_host.prepare(args.sync_id, root=args.root, reset=args.reset))
+            return 0
+
         if args.command == "set-start":
             command = sync_host.set_start(
                 args.sync_id,
@@ -100,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
                 clock=args.clock,
                 overwrite=args.overwrite,
                 reset=args.reset,
+                nonblocking=args.nonblocking,
             )
             _print_json(command.payload)
             return 0

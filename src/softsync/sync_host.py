@@ -3,7 +3,18 @@ from __future__ import annotations
 import os
 from typing import Any, Mapping, Sequence
 
-from soft_sync.core import Coordinator, PendingStart, StartSignal
+from softsync.core import Coordinator, PendingStart, StartSignal
+
+
+def prepare(
+    sync_id: str,
+    *,
+    root: str | os.PathLike[str] | None = None,
+    reset: bool = False,
+) -> dict[str, Any]:
+    """Create host-owned sync state without starting or arming the run."""
+
+    return Coordinator(sync_id, root=root, reset=reset).status()
 
 
 def set_start(
@@ -34,6 +45,7 @@ def set_start(
         target_ns=target_ns,
         metadata=metadata,
         overwrite=overwrite,
+        nonblocking=nonblocking,
     )
 
 
@@ -45,6 +57,7 @@ def start(
     metadata: Mapping[str, Any] | None = None,
     overwrite: bool = False,
     reset: bool = False,
+    nonblocking: bool = False,
 ) -> StartSignal:
     """Publish the active start signal for `sync_id`.
 

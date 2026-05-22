@@ -1,12 +1,13 @@
 __version__ = "0.1.0"
 
-from soft_sync.core import (
+from softsync.core import (
     DEFAULT_ROOT,
     ACTIVE_SCHEMA,
     CANCEL_SCHEMA,
     CLIENT_STARTED_SCHEMA,
     DONE_SCHEMA,
     PENDING_START_SCHEMA,
+    SCHEDULED_START_SCHEMA,
     READY_SCHEMA,
     SESSION_SCHEMA,
     START_SCHEMA,
@@ -28,6 +29,7 @@ from soft_sync.core import (
 )
 from . import sync_client, sync_host
 
+prepare = sync_host.prepare
 set_start = sync_host.set_start
 start = sync_host.start
 stop = sync_host.stop
@@ -53,6 +55,7 @@ __all__ = [
     "CLIENT_STARTED_SCHEMA",
     "DONE_SCHEMA",
     "PENDING_START_SCHEMA",
+    "SCHEDULED_START_SCHEMA",
     "READY_SCHEMA",
     "SESSION_SCHEMA",
     "START_SCHEMA",
@@ -63,6 +66,7 @@ __all__ = [
     "Client",
     "Coordinator",
     "PendingStart",
+    "prepare",
     "SoftSyncCancelled",
     "SoftSyncClockMismatch",
     "SoftSyncError",

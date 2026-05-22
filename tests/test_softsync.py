@@ -6,13 +6,14 @@ import time
 
 import pytest
 
-import soft_sync
-from soft_sync.cli import main
-from soft_sync import sync_client, sync_host
+import softsync
+from softsync.cli import main
+from softsync import sync_client, sync_host
 
 
 def test_host_start_and_client_sync_watch_do_not_require_readiness(tmp_path):
-    observed: list[soft_sync.StartSignal] = []
+    sync_host.prepare("experiment-a", root=tmp_path)
+    observed: list[softsync.StartSignal] = []
 
     def wait() -> None:
         observed.append(
@@ -44,7 +45,7 @@ def test_host_set_start_requires_delay_or_target(tmp_path):
     with pytest.raises(ValueError):
         sync_host.set_start("experiment-a", root=tmp_path)
     with pytest.raises(ValueError):
-        soft_sync.set_start("experiment-a", root=tmp_path)
+        softsync.set_start("experiment-a", root=tmp_path)
     with pytest.raises(ValueError):
         sync_host.set_start(
             "experiment-a",
@@ -68,7 +69,7 @@ def test_set_start_arms_but_does_not_signal_until_start(tmp_path):
     assert (tmp_path / "experiment-a" / "pending_start.json").exists()
     assert not (tmp_path / "experiment-a" / "start.json").exists()
 
-    with pytest.raises(soft_sync.SoftSyncTimeout):
+    with pytest.raises(softsync.SoftSyncTimeout):
         sync_client.watch_start("experiment-a", root=tmp_path, timeout_s=0.01)
 
     observed = sync_host.start("experiment-a", root=tmp_path)
@@ -92,6 +93,17 @@ def test_watch_start_returns_boundary_without_sleeping_to_it(tmp_path):
     assert observed.kwargs() == {"start_at_monotonic_ns": start_at}
 
 
+def test_start_with_future_target_publishes_start_json_immediately(tmp_path):
+    start_at = time.monotonic_ns() + 1_000_000_000
+    sync_host.set_start("experiment-a", root=tmp_path, target_ns=start_at)
+
+    observed = sync_host.start("experiment-a", root=tmp_path)
+
+    assert (tmp_path / "experiment-a" / "start.json").exists()
+    assert observed.start_at_monotonic_ns == start_at
+    assert observed.late_by_ns() == 0
+
+
 def test_armed_delay_resolves_from_start_call(tmp_path):
     sync_host.set_start("experiment-a", root=tmp_path, delay_s=0.05)
     time.sleep(0.02)
@@ -105,7 +117,7 @@ def test_armed_delay_resolves_from_start_call(tmp_path):
 
 
 def test_readiness_is_optional_but_available(tmp_path):
-    sync = soft_sync.Coordinator("experiment-a", root=tmp_path)
+    sync = softsync.Coordinator("experiment-a", root=tmp_path)
 
     sync_client.sync_ready(
         "experiment-a",
@@ -121,6 +133,7 @@ def test_readiness_is_optional_but_available(tmp_path):
 
 
 def test_sync_ready_and_get_clients_filter_stale_files(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
     fresh = sync_client.sync_ready("experiment-a", "fresh", root=tmp_path)
     stale = sync_client.sync_ready("experiment-a", "stale", root=tmp_path)
     stale.update(
@@ -146,6 +159,7 @@ def test_sync_ready_and_get_clients_filter_stale_files(tmp_path):
 
 
 def test_active_and_report_start_are_visible_to_host(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
     sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
     sync_client.sync_active("experiment-a", "client-a", root=tmp_path)
     started = sync_client.report_start("experiment-a", "client-a", root=tmp_path)
@@ -158,6 +172,7 @@ def test_active_and_report_start_are_visible_to_host(tmp_path):
 
 
 def test_sync_done_has_consistent_state_and_is_visible_to_host(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
     done = sync_client.sync_done("experiment-a", "client-a", root=tmp_path)
 
     clients = sync_host.get_clients("experiment-a", root=tmp_path)
@@ -169,6 +184,7 @@ def test_sync_done_has_consistent_state_and_is_visible_to_host(tmp_path):
 
 
 def test_stop_is_observed_by_client(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
     observed: list[dict[str, object]] = []
 
     def wait() -> None:
@@ -205,7 +221,7 @@ def test_cancel_after_start_interrupts_client_waiting_for_stop(tmp_path):
                 root=tmp_path,
                 timeout_s=1,
             )
-        except soft_sync.SoftSyncCancelled as exc:
+        except softsync.SoftSyncCancelled as exc:
             observed.append(exc.payload)
 
     thread = threading.Thread(target=wait)
@@ -244,22 +260,41 @@ def test_remove_deletes_sync_folder(tmp_path):
 def test_cancel_interrupts_client_wait(tmp_path):
     sync_host.cancel("experiment-a", root=tmp_path, reason="setup failed")
 
-    with pytest.raises(soft_sync.SoftSyncCancelled) as exc:
+    with pytest.raises(softsync.SoftSyncCancelled) as exc:
         sync_client.sync_watch("experiment-a", root=tmp_path, timeout_s=0.1)
 
     assert "setup failed" in str(exc.value)
 
 
 def test_get_clients_missing_sync_raises_without_creating_state(tmp_path):
-    with pytest.raises(soft_sync.SoftSyncNotFound):
+    with pytest.raises(softsync.SoftSyncNotFound):
         sync_host.get_clients("missing", root=tmp_path)
 
     assert list(tmp_path.iterdir()) == []
 
 
 def test_status_missing_sync_raises_without_creating_state(tmp_path):
-    with pytest.raises(soft_sync.SoftSyncNotFound):
+    with pytest.raises(softsync.SoftSyncNotFound):
         sync_host.status("missing", root=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda root: sync_client.watch_start("missing", root=root, timeout_s=0.01),
+        lambda root: sync_client.sync_watch("missing", root=root, timeout_s=0.01),
+        lambda root: sync_client.watch_stop("missing", root=root, timeout_s=0.01),
+        lambda root: sync_client.sync_ready("missing", "client-a", root=root),
+        lambda root: sync_client.sync_active("missing", "client-a", root=root),
+        lambda root: sync_client.report_start("missing", "client-a", root=root),
+        lambda root: sync_client.sync_done("missing", "client-a", root=root),
+    ],
+)
+def test_client_methods_missing_sync_raise_without_creating_state(tmp_path, call):
+    with pytest.raises(softsync.SoftSyncNotFound):
+        call(tmp_path)
 
     assert list(tmp_path.iterdir()) == []
 
@@ -272,12 +307,12 @@ def test_sync_ids_are_path_safe(tmp_path):
 def test_existing_start_requires_reset_or_overwrite(tmp_path):
     sync_host.start("experiment-a", root=tmp_path)
 
-    with pytest.raises(soft_sync.SoftSyncStateError):
+    with pytest.raises(softsync.SoftSyncStateError):
         sync_host.start("experiment-a", root=tmp_path)
 
     replacement = sync_host.start("experiment-a", root=tmp_path, overwrite=True)
 
-    assert replacement.payload["schema"] == soft_sync.START_SCHEMA
+    assert replacement.payload["schema"] == softsync.START_SCHEMA
 
 
 def test_concurrent_start_has_one_winner(tmp_path):
@@ -289,7 +324,7 @@ def test_concurrent_start_has_one_winner(tmp_path):
         barrier.wait(timeout=1)
         try:
             sync_host.start("experiment-a", root=tmp_path)
-        except soft_sync.SoftSyncStateError:
+        except softsync.SoftSyncStateError:
             result = "state-error"
         else:
             result = "started"

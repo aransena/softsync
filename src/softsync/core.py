@@ -6,6 +6,8 @@ import re
 import select
 import shutil
 import socket
+import subprocess
+import sys
 import time
 import uuid
 import ctypes
@@ -20,17 +22,18 @@ try:
 except ImportError:  # pragma: no cover - exercised only on non-Unix platforms.
     fcntl = None
 
-DEFAULT_ROOT = Path("/tmp/soft_sync")
+DEFAULT_ROOT = Path("/tmp/softsync")
 
-START_SCHEMA = "soft_sync.start.v1"
-PENDING_START_SCHEMA = "soft_sync.pending_start.v1"
-STOP_SCHEMA = "soft_sync.stop.v1"
-CANCEL_SCHEMA = "soft_sync.cancel.v1"
-READY_SCHEMA = "soft_sync.ready.v1"
-ACTIVE_SCHEMA = "soft_sync.active.v1"
-CLIENT_STARTED_SCHEMA = "soft_sync.client_started.v1"
-DONE_SCHEMA = "soft_sync.done.v1"
-SESSION_SCHEMA = "soft_sync.session.v1"
+START_SCHEMA = "softsync.start.v1"
+PENDING_START_SCHEMA = "softsync.pending_start.v1"
+SCHEDULED_START_SCHEMA = "softsync.scheduled_start.v1"
+STOP_SCHEMA = "softsync.stop.v1"
+CANCEL_SCHEMA = "softsync.cancel.v1"
+READY_SCHEMA = "softsync.ready.v1"
+ACTIVE_SCHEMA = "softsync.active.v1"
+CLIENT_STARTED_SCHEMA = "softsync.client_started.v1"
+DONE_SCHEMA = "softsync.done.v1"
+SESSION_SCHEMA = "softsync.session.v1"
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
@@ -48,7 +51,7 @@ _FINE_SLEEP_THRESHOLD_NS = 500_000
 
 
 class SoftSyncError(RuntimeError):
-    """Base exception for soft_sync failures."""
+    """Base exception for softsync failures."""
 
 
 class SoftSyncTimeout(SoftSyncError):
@@ -123,11 +126,15 @@ def _atomic_write_json(
     path: Path,
     payload: Mapping[str, Any],
     *,
+    create_parents: bool = True,
     overwrite: bool = True,
 ) -> None:
     """Write JSON so readers see either the old file or the complete new file."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=create_parents, exist_ok=True)
+    except FileNotFoundError as exc:
+        raise SoftSyncNotFound(f"{path.parent.parent} does not exist") from exc
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with tmp_path.open("w", encoding="utf-8") as handle:
@@ -156,6 +163,30 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise SoftSyncError(f"{path} did not contain a JSON object")
     return payload
+
+
+def _read_session_scheduled_start(session_file: Path) -> dict[str, Any] | None:
+    session = _read_json(session_file)
+    scheduled = session.get("scheduled_start")
+    if scheduled is None:
+        return None
+    if not isinstance(scheduled, dict):
+        raise SoftSyncError(f"{session_file} has invalid scheduled_start")
+    if scheduled.get("schema") != SCHEDULED_START_SCHEMA:
+        raise SoftSyncError(f"{session_file} scheduled_start is not {SCHEDULED_START_SCHEMA}")
+    return dict(scheduled)
+
+
+def _write_session_scheduled_start(
+    session_file: Path,
+    schedule: Mapping[str, Any] | None,
+) -> None:
+    session = _read_json(session_file)
+    if schedule is None:
+        session.pop("scheduled_start", None)
+    else:
+        session["scheduled_start"] = dict(schedule)
+    _atomic_write_json(session_file, session)
 
 
 def _unlink_if_exists(path: Path) -> None:
@@ -219,6 +250,141 @@ def _sync_lifecycle_lock(root: Path, sync_id: str) -> Iterator[None]:
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+def _clock_now_ns(clock: str) -> int:
+    if clock == "monotonic_ns":
+        return time.monotonic_ns()
+    if clock == "unix_ns":
+        return time.time_ns()
+    raise ValueError("clock must be 'monotonic_ns' or 'unix_ns'")
+
+
+def _sleep_until_ns(clock: str, target_ns: int, *, cancel_file: Path | None = None) -> None:
+    while True:
+        if cancel_file is not None and cancel_file.exists():
+            raise SoftSyncCancelled(_read_json(cancel_file))
+        remaining_ns = target_ns - _clock_now_ns(clock)
+        if remaining_ns <= 0:
+            return
+        if remaining_ns > _COARSE_SLEEP_SLACK_NS:
+            sleep_ns = remaining_ns - _COARSE_SLEEP_SLACK_NS
+            time.sleep(min(sleep_ns / 1_000_000_000, _COARSE_SLEEP_MAX_S))
+        elif remaining_ns > _FINE_SLEEP_THRESHOLD_NS:
+            time.sleep(0.0001)
+
+
+def _start_payload_from_schedule(schedule: Mapping[str, Any]) -> dict[str, Any]:
+    clock = str(schedule["clock"])
+    target_ns = int(schedule["target_ns"])
+    issued_at_monotonic_ns = time.monotonic_ns()
+    issued_at_unix_ns = time.time_ns()
+    payload: dict[str, Any] = {
+        "schema": START_SCHEMA,
+        "command": "start",
+        "sync_id": str(schedule["sync_id"]),
+        "coordinator_id": str(schedule.get("coordinator_id") or ""),
+        "clock": clock,
+        "target_ns": target_ns,
+        "issued_at_monotonic_ns": issued_at_monotonic_ns,
+        "issued_at_unix_ns": issued_at_unix_ns,
+        "armed": bool(schedule.get("armed")),
+        **_identity(),
+    }
+    if clock == "monotonic_ns":
+        payload["start_at_monotonic_ns"] = target_ns
+    else:
+        payload["start_at_unix_ns"] = target_ns
+
+    passthrough_fields = [
+        "delay_s",
+        "delay_ns",
+        "configured_target_ns",
+        "configured_at_monotonic_ns",
+        "configured_at_unix_ns",
+        "metadata",
+        "scheduled_at_monotonic_ns",
+        "scheduled_at_unix_ns",
+    ]
+    for field in passthrough_fields:
+        if field in schedule:
+            payload[field] = schedule[field]
+    return payload
+
+
+def _publish_scheduled_start(
+    sync_id: str,
+    *,
+    root: str | os.PathLike[str] | None = None,
+) -> StartSignal:
+    sync_id = validate_name(sync_id, field="sync_id")
+    root_path = Path(root or DEFAULT_ROOT)
+    sync_dir = sync_path(sync_id, root=root_path)
+    session_file = sync_dir / "session.json"
+    start_file = sync_dir / "start.json"
+    pending_start_file = sync_dir / "pending_start.json"
+    cancel_file = sync_dir / "cancel.json"
+
+    while True:
+        if cancel_file.exists():
+            raise SoftSyncCancelled(_read_json(cancel_file))
+        schedule = _read_session_scheduled_start(session_file)
+        if schedule is None:
+            if start_file.exists():
+                return StartSignal.from_payload(_read_json(start_file), path=start_file)
+            raise SoftSyncNotFound(f"{session_file} has no scheduled_start")
+        clock = str(schedule["clock"])
+        target_ns = int(schedule["target_ns"])
+        remaining_ns = target_ns - _clock_now_ns(clock)
+        if remaining_ns <= 0:
+            break
+        time.sleep(min(remaining_ns / 1_000_000_000, _COARSE_SLEEP_MAX_S))
+
+    with _sync_lifecycle_lock(root_path, sync_id):
+        if cancel_file.exists():
+            cancel_payload = _read_json(cancel_file)
+            _write_session_scheduled_start(session_file, None)
+            raise SoftSyncCancelled(cancel_payload)
+        schedule = _read_session_scheduled_start(session_file)
+        if schedule is None:
+            if start_file.exists():
+                return StartSignal.from_payload(_read_json(start_file), path=start_file)
+            raise SoftSyncNotFound(f"{session_file} has no scheduled_start")
+        overwrite = bool(schedule.get("overwrite"))
+        if start_file.exists() and not overwrite:
+            raise SoftSyncStateError(f"{start_file} already exists")
+        payload = _start_payload_from_schedule(schedule)
+        _atomic_write_json(start_file, payload, overwrite=overwrite)
+        _unlink_if_exists(pending_start_file)
+        _write_session_scheduled_start(session_file, None)
+        return StartSignal.from_payload(payload, path=start_file)
+
+
+def _spawn_scheduled_start_publisher(
+    sync_id: str,
+    *,
+    root: str | os.PathLike[str] | None = None,
+) -> None:
+    env = os.environ.copy()
+    src_root = str(Path(__file__).resolve().parents[1])
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        src_root if not current_pythonpath else f"{src_root}{os.pathsep}{current_pythonpath}"
+    )
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "softsync._start_publisher",
+            sync_id,
+            str(Path(root or DEFAULT_ROOT)),
+        ],
+        close_fds=True,
+        env=env,
+        start_new_session=True,
+        stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+    )
 
 
 class _DirectoryWatcher:
@@ -289,7 +455,7 @@ class _DirectoryWatcher:
 
 @dataclass(frozen=True)
 class PendingStart:
-    """Parsed contents of `/tmp/soft_sync/<sync_id>/pending_start.json`."""
+    """Parsed contents of `/tmp/softsync/<sync_id>/pending_start.json`."""
 
     sync_id: str
     clock: str
@@ -351,7 +517,7 @@ class PendingStart:
 
 @dataclass(frozen=True)
 class StartSignal:
-    """Parsed contents of `/tmp/soft_sync/<sync_id>/start.json`."""
+    """Parsed contents of `/tmp/softsync/<sync_id>/start.json`."""
 
     sync_id: str
     clock: str
@@ -463,6 +629,10 @@ class Coordinator:
         return self.path / "pending_start.json"
 
     @property
+    def session_file(self) -> Path:
+        return self.path / "session.json"
+
+    @property
     def start_file(self) -> Path:
         return self.path / "start.json"
 
@@ -495,11 +665,10 @@ class Coordinator:
         self.active_dir.mkdir(parents=True, exist_ok=True)
         self.started_dir.mkdir(parents=True, exist_ok=True)
         self.done_dir.mkdir(parents=True, exist_ok=True)
-        session_file = self.path / "session.json"
-        if not session_file.exists():
+        if not self.session_file.exists():
             try:
                 _atomic_write_json(
-                    session_file,
+                    self.session_file,
                     {
                         "schema": SESSION_SCHEMA,
                         "sync_id": self.sync_id,
@@ -529,6 +698,7 @@ class Coordinator:
                     shutil.rmtree(directory)
                     _fsync_dir(directory.parent)
             self._ensure_session()
+            _write_session_scheduled_start(self.session_file, None)
 
     def remove(self) -> None:
         with _sync_lifecycle_lock(self.root, self.sync_id):
@@ -560,6 +730,9 @@ class Coordinator:
                 raise SoftSyncStateError(f"{self.cancel_file} already exists")
             if self.start_file.exists() and not overwrite:
                 raise SoftSyncStateError(f"{self.start_file} already exists")
+            scheduled_start = _read_session_scheduled_start(self.session_file)
+            if scheduled_start is not None and not overwrite:
+                raise SoftSyncStateError(f"{self.session_file} already has scheduled_start")
             if self.pending_start_file.exists() and not overwrite:
                 raise SoftSyncStateError(f"{self.pending_start_file} already exists")
 
@@ -591,8 +764,9 @@ class Coordinator:
         clock: str = "monotonic_ns",
         metadata: Mapping[str, Any] | None = None,
         overwrite: bool = False,
+        nonblocking: bool = False,
     ) -> StartSignal:
-        """Publish the active start signal."""
+        """Publish the active start signal at its target boundary."""
 
         with _sync_lifecycle_lock(self.root, self.sync_id):
             if clock not in {"monotonic_ns", "unix_ns"}:
@@ -601,6 +775,9 @@ class Coordinator:
                 raise SoftSyncStateError(f"{self.cancel_file} already exists")
             if self.start_file.exists() and not overwrite:
                 raise SoftSyncStateError(f"{self.start_file} already exists")
+            scheduled_start = _read_session_scheduled_start(self.session_file)
+            if scheduled_start is not None and not overwrite:
+                raise SoftSyncStateError(f"{self.session_file} already has scheduled_start")
 
             pending = (
                 PendingStart.from_payload(
@@ -610,56 +787,65 @@ class Coordinator:
                 if self.pending_start_file.exists()
                 else None
             )
-            issued_at_monotonic_ns = time.monotonic_ns()
-            issued_at_unix_ns = time.time_ns()
+            scheduled_at_monotonic_ns = time.monotonic_ns()
+            scheduled_at_unix_ns = time.time_ns()
             resolved_clock = pending.clock if pending else clock
             target_ns = (
                 pending.resolve_target_ns(
-                    issued_at_monotonic_ns=issued_at_monotonic_ns,
-                    issued_at_unix_ns=issued_at_unix_ns,
+                    issued_at_monotonic_ns=scheduled_at_monotonic_ns,
+                    issued_at_unix_ns=scheduled_at_unix_ns,
                 )
                 if pending
                 else (
-                    issued_at_monotonic_ns
+                    scheduled_at_monotonic_ns
                     if resolved_clock == "monotonic_ns"
-                    else issued_at_unix_ns
+                    else scheduled_at_unix_ns
                 )
             )
 
-            payload: dict[str, Any] = {
-                "schema": START_SCHEMA,
-                "command": "start",
+            schedule: dict[str, Any] = {
+                "schema": SCHEDULED_START_SCHEMA,
+                "command": "schedule_start",
                 "sync_id": self.sync_id,
                 "coordinator_id": self.coordinator_id,
                 "clock": resolved_clock,
                 "target_ns": int(target_ns),
-                "issued_at_monotonic_ns": issued_at_monotonic_ns,
-                "issued_at_unix_ns": issued_at_unix_ns,
+                "scheduled_at_monotonic_ns": scheduled_at_monotonic_ns,
+                "scheduled_at_unix_ns": scheduled_at_unix_ns,
                 "armed": pending is not None,
+                "overwrite": overwrite,
                 **_identity(),
             }
-            if resolved_clock == "monotonic_ns":
-                payload["start_at_monotonic_ns"] = int(target_ns)
-            else:
-                payload["start_at_unix_ns"] = int(target_ns)
             if pending:
                 if pending.delay_s is not None:
-                    payload["delay_s"] = pending.delay_s
-                    payload["delay_ns"] = int(pending.delay_s * 1_000_000_000)
+                    schedule["delay_s"] = pending.delay_s
+                    schedule["delay_ns"] = int(pending.delay_s * 1_000_000_000)
                 else:
-                    payload["configured_target_ns"] = pending.target_ns
+                    schedule["configured_target_ns"] = pending.target_ns
                 if pending.payload.get("metadata"):
-                    payload["metadata"] = dict(pending.payload["metadata"])
-                payload["configured_at_monotonic_ns"] = pending.configured_at_monotonic_ns
-                payload["configured_at_unix_ns"] = pending.configured_at_unix_ns
+                    schedule["metadata"] = dict(pending.payload["metadata"])
+                schedule["configured_at_monotonic_ns"] = pending.configured_at_monotonic_ns
+                schedule["configured_at_unix_ns"] = pending.configured_at_unix_ns
             if metadata:
-                merged_metadata = dict(payload.get("metadata") or {})
+                merged_metadata = dict(schedule.get("metadata") or {})
                 merged_metadata.update(dict(metadata))
-                payload["metadata"] = merged_metadata
+                schedule["metadata"] = merged_metadata
 
-            _atomic_write_json(self.start_file, payload, overwrite=overwrite)
+            target_is_due = target_ns <= _clock_now_ns(resolved_clock)
+            if target_is_due:
+                payload = _start_payload_from_schedule(schedule)
+                _atomic_write_json(self.start_file, payload, overwrite=overwrite)
+                _unlink_if_exists(self.pending_start_file)
+                return StartSignal.from_payload(payload, path=self.start_file)
+
+            _write_session_scheduled_start(self.session_file, schedule)
             _unlink_if_exists(self.pending_start_file)
-            return StartSignal.from_payload(payload, path=self.start_file)
+            predicted_payload = _start_payload_from_schedule(schedule)
+
+        if nonblocking:
+            _spawn_scheduled_start_publisher(self.sync_id, root=self.root)
+            return StartSignal.from_payload(predicted_payload, path=self.start_file)
+        return _publish_scheduled_start(self.sync_id, root=self.root)
 
     def cancel(
         self,
@@ -828,6 +1014,7 @@ class Coordinator:
             "path": str(self.path),
             "armed": self.pending_start_file.exists(),
             "started": self.start_file.exists(),
+            "scheduled": _read_session_scheduled_start(self.session_file) is not None,
             "cancelled": self.cancel_file.exists(),
             "clients": self.get_clients(),
         }
@@ -879,7 +1066,12 @@ class Client:
     def done_file(self) -> Path:
         return self.path / "done" / f"{self.client_id}.json"
 
+    def _require_sync_folder(self) -> None:
+        if not self.path.is_dir():
+            raise SoftSyncNotFound(f"{self.path} does not exist")
+
     def sync_ready(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        self._require_sync_folder()
         ready_at_monotonic_ns = time.monotonic_ns()
         ready_at_unix_ns = time.time_ns()
         payload: dict[str, Any] = {
@@ -893,10 +1085,11 @@ class Client:
         }
         if metadata:
             payload["metadata"] = dict(metadata)
-        _atomic_write_json(self.ready_file, payload)
+        _atomic_write_json(self.ready_file, payload, create_parents=False)
         return payload
 
     def sync_active(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        self._require_sync_folder()
         active_at_monotonic_ns = time.monotonic_ns()
         active_at_unix_ns = time.time_ns()
         payload: dict[str, Any] = {
@@ -910,7 +1103,7 @@ class Client:
         }
         if metadata:
             payload["metadata"] = dict(metadata)
-        _atomic_write_json(self.active_file, payload)
+        _atomic_write_json(self.active_file, payload, create_parents=False)
         return payload
 
     def watch_start(
@@ -919,7 +1112,7 @@ class Client:
         timeout_s: float | None = None,
         poll_interval_s: float = 0.005,
     ) -> StartSignal:
-        self.path.mkdir(parents=True, exist_ok=True)
+        self._require_sync_folder()
         deadline = _deadline(timeout_s)
         with _DirectoryWatcher(self.path) as watcher:
             while True:
@@ -940,7 +1133,7 @@ class Client:
         timeout_s: float | None = None,
         poll_interval_s: float = 0.005,
     ) -> dict[str, Any]:
-        self.path.mkdir(parents=True, exist_ok=True)
+        self._require_sync_folder()
         deadline = _deadline(timeout_s)
         with _DirectoryWatcher(self.path) as watcher:
             while True:
@@ -963,6 +1156,7 @@ class Client:
         return signal
 
     def report_start(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        self._require_sync_folder()
         started_at_monotonic_ns = time.monotonic_ns()
         started_at_unix_ns = time.time_ns()
         payload: dict[str, Any] = {
@@ -976,10 +1170,11 @@ class Client:
         }
         if metadata:
             payload["metadata"] = dict(metadata)
-        _atomic_write_json(self.started_file, payload)
+        _atomic_write_json(self.started_file, payload, create_parents=False)
         return payload
 
     def sync_done(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        self._require_sync_folder()
         payload: dict[str, Any] = {
             "schema": DONE_SCHEMA,
             "sync_id": self.sync_id,
@@ -991,7 +1186,7 @@ class Client:
         }
         if metadata:
             payload["metadata"] = dict(metadata)
-        _atomic_write_json(self.done_file, payload)
+        _atomic_write_json(self.done_file, payload, create_parents=False)
         return payload
 
 
@@ -1046,11 +1241,13 @@ def start(
     metadata: Mapping[str, Any] | None = None,
     overwrite: bool = False,
     reset: bool = False,
+    nonblocking: bool = False,
 ) -> StartSignal:
     return Coordinator(sync_id, root=root, reset=reset).start(
         clock=clock,
         metadata=metadata,
         overwrite=overwrite,
+        nonblocking=nonblocking,
     )
 
 

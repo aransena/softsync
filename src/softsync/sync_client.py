@@ -4,7 +4,7 @@ import asyncio
 import os
 from typing import Any, Mapping
 
-from soft_sync.core import Client, StartSignal
+from softsync.core import Client, StartSignal
 
 
 def sync_watch(
