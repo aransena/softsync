@@ -109,7 +109,6 @@ def main(argv: list[str] | None = None) -> int:
                 clock=args.clock,
                 overwrite=args.overwrite,
                 reset=args.reset,
-                nonblocking=args.nonblocking,
             )
             _print_json(command.payload)
             return 0
@@ -121,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
                 clock=args.clock,
                 overwrite=args.overwrite,
                 reset=args.reset,
+                nonblocking=args.nonblocking,
             )
             _print_json(command.payload)
             return 0

@@ -45,7 +45,6 @@ def set_start(
         target_ns=target_ns,
         metadata=metadata,
         overwrite=overwrite,
-        nonblocking=nonblocking,
     )
 
 
@@ -69,6 +68,7 @@ def start(
         clock=clock,
         metadata=metadata,
         overwrite=overwrite,
+        nonblocking=nonblocking,
     )
 
 

@@ -327,7 +327,11 @@ def _publish_scheduled_start(
 
     while True:
         if cancel_file.exists():
-            raise SoftSyncCancelled(_read_json(cancel_file))
+            cancel_payload = _read_json(cancel_file)
+            with _sync_lifecycle_lock(root_path, sync_id):
+                _unlink_if_exists(pending_start_file)
+                _write_session_scheduled_start(session_file, None)
+            raise SoftSyncCancelled(cancel_payload)
         schedule = _read_session_scheduled_start(session_file)
         if schedule is None:
             if start_file.exists():
@@ -735,6 +739,8 @@ class Coordinator:
                 raise SoftSyncStateError(f"{self.session_file} already has scheduled_start")
             if self.pending_start_file.exists() and not overwrite:
                 raise SoftSyncStateError(f"{self.pending_start_file} already exists")
+            if scheduled_start is not None:
+                _write_session_scheduled_start(self.session_file, None)
 
             payload: dict[str, Any] = {
                 "schema": PENDING_START_SCHEMA,
@@ -836,6 +842,7 @@ class Coordinator:
                 payload = _start_payload_from_schedule(schedule)
                 _atomic_write_json(self.start_file, payload, overwrite=overwrite)
                 _unlink_if_exists(self.pending_start_file)
+                _write_session_scheduled_start(self.session_file, None)
                 return StartSignal.from_payload(payload, path=self.start_file)
 
             _write_session_scheduled_start(self.session_file, schedule)
@@ -872,6 +879,8 @@ class Coordinator:
             if metadata:
                 payload["metadata"] = dict(metadata)
             _atomic_write_json(self.cancel_file, payload, overwrite=overwrite)
+            _unlink_if_exists(self.pending_start_file)
+            _write_session_scheduled_start(self.session_file, None)
             return payload
 
     def stop(

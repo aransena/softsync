@@ -56,7 +56,7 @@ def test_host_set_start_requires_delay_or_target(tmp_path):
 
 
 def test_set_start_arms_but_does_not_signal_until_start(tmp_path):
-    start_at = time.monotonic_ns() + 1_000_000_000
+    start_at = time.monotonic_ns() + 80_000_000
 
     pending = sync_host.set_start(
         "experiment-a",
@@ -83,7 +83,7 @@ def test_set_start_arms_but_does_not_signal_until_start(tmp_path):
 
 
 def test_watch_start_returns_boundary_without_sleeping_to_it(tmp_path):
-    start_at = time.monotonic_ns() + 1_000_000_000
+    start_at = time.monotonic_ns() + 50_000_000
     sync_host.set_start("experiment-a", root=tmp_path, target_ns=start_at)
     sync_host.start("experiment-a", root=tmp_path)
 
@@ -93,15 +93,50 @@ def test_watch_start_returns_boundary_without_sleeping_to_it(tmp_path):
     assert observed.kwargs() == {"start_at_monotonic_ns": start_at}
 
 
-def test_start_with_future_target_publishes_start_json_immediately(tmp_path):
-    start_at = time.monotonic_ns() + 1_000_000_000
+def test_start_with_future_target_publishes_start_json_at_target(tmp_path):
+    start_path = tmp_path / "experiment-a" / "start.json"
+    start_at = time.monotonic_ns() + 120_000_000
     sync_host.set_start("experiment-a", root=tmp_path, target_ns=start_at)
+    observed: list[softsync.StartSignal] = []
 
-    observed = sync_host.start("experiment-a", root=tmp_path)
+    def start() -> None:
+        observed.append(sync_host.start("experiment-a", root=tmp_path))
 
-    assert (tmp_path / "experiment-a" / "start.json").exists()
-    assert observed.start_at_monotonic_ns == start_at
-    assert observed.late_by_ns() == 0
+    thread = threading.Thread(target=start)
+    thread.start()
+    time.sleep(0.02)
+
+    assert thread.is_alive()
+    assert not start_path.exists()
+
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert start_path.exists()
+    assert observed[0].start_at_monotonic_ns == start_at
+
+
+def test_start_nonblocking_schedules_start_in_session_until_target(tmp_path):
+    session_path = tmp_path / "experiment-a" / "session.json"
+    start_path = tmp_path / "experiment-a" / "start.json"
+    sync_host.set_start("experiment-a", root=tmp_path, delay_s=0.1)
+
+    command = sync_host.start("experiment-a", root=tmp_path, nonblocking=True)
+
+    assert command.payload["schema"] == softsync.START_SCHEMA
+    assert not start_path.exists()
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    assert session["scheduled_start"]["schema"] == softsync.SCHEDULED_START_SCHEMA
+
+    observed = sync_client.watch_start("experiment-a", root=tmp_path, timeout_s=1)
+
+    assert observed.start_at_monotonic_ns == command.start_at_monotonic_ns
+    for _ in range(100):
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        if "scheduled_start" not in session:
+            break
+        time.sleep(0.01)
+    assert "scheduled_start" not in session
 
 
 def test_armed_delay_resolves_from_start_call(tmp_path):
@@ -236,8 +271,24 @@ def test_cancel_after_start_interrupts_client_waiting_for_stop(tmp_path):
     assert observed == [cancel]
 
 
+def test_cancel_clears_pending_and_scheduled_start(tmp_path):
+    session_path = tmp_path / "experiment-a" / "session.json"
+    pending_path = tmp_path / "experiment-a" / "pending_start.json"
+    sync_host.set_start("experiment-a", root=tmp_path, delay_s=0.2)
+    sync_host.start("experiment-a", root=tmp_path, nonblocking=True)
+
+    cancel = sync_host.cancel("experiment-a", root=tmp_path, reason="abort")
+
+    session = json.loads(session_path.read_text(encoding="utf-8"))
+    assert "scheduled_start" not in session
+    assert not pending_path.exists()
+    with pytest.raises(softsync.SoftSyncCancelled) as exc:
+        sync_client.watch_start("experiment-a", root=tmp_path, timeout_s=0.1)
+    assert exc.value.payload == cancel
+
+
 def test_reset_clears_state_but_keeps_sync_folder(tmp_path):
-    sync_host.set_start("experiment-a", root=tmp_path, delay_s=0.1)
+    sync_host.set_start("experiment-a", root=tmp_path, delay_s=0.01)
     sync_host.start("experiment-a", root=tmp_path)
     sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
 

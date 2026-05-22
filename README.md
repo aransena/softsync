@@ -68,12 +68,25 @@ sync_host.start("experiment-a")
 `set_start()` only writes `pending_start.json`. It does not activate clients.
 `start()` writes `start.json`, which is the active signal clients observe.
 
-`sync_host.start()` is non-blocking. If a delay or target timestamp was armed,
-`start()` writes `start.json` immediately with that future target and returns.
-The creation of `start.json` releases the schedule to clients; the target
-timestamp is the work boundary. Clients that use `sync_watch()` block until that
-target arrives, while clients that use `watch_start()` can forward the target
-into another prepared API.
+If no future schedule is armed, `sync_host.start()` writes `start.json` and
+returns immediately. If a delay or target timestamp is armed and the target is
+still in the future, `sync_host.start()` blocks until that boundary, writes
+`start.json`, and then returns. This keeps timing logic host-owned: clients can
+use event-based filesystem watches and treat creation of `start.json` as the
+release trigger.
+
+For a non-blocking host process, pass `nonblocking=True`:
+
+```python
+sync_host.set_start("experiment-a", delay_s=0.5)
+signal = sync_host.start("experiment-a", nonblocking=True)
+```
+
+In non-blocking mode, `start()` records a host-owned `scheduled_start` object
+inside `session.json`, starts a detached publisher process, and returns the
+planned `StartSignal`. `start.json` is still not created until the scheduled
+boundary is reached. Clients should not watch `session.json`; it is host status
+state.
 
 Client that starts its own work:
 
@@ -83,8 +96,10 @@ start_capture()
 ```
 
 `sync_watch()` blocks until `start.json` exists, then waits until the target
-start time has arrived. On Linux it uses `inotify` to wake on file changes. If
-`inotify` is unavailable, it falls back to polling.
+start time has arrived if needed. With host-managed scheduled starts,
+`start.json` is created at the target boundary, so clients do not need to
+implement delay or timestamp scheduling themselves. On Linux it uses `inotify`
+to wake on file changes. If `inotify` is unavailable, it falls back to polling.
 
 Client that forwards the target into another prepared API:
 
@@ -250,13 +265,18 @@ Host lifecycle messages are serialized with a per-sync file lock under
 messages are created with exclusive atomic creation so concurrent hosts cannot
 both successfully publish the same lifecycle file.
 
-- `session.json`: host setup record. Schema `softsync.session.v1`.
+- `session.json`: host setup and status record. Schema `softsync.session.v1`.
+  During `start(nonblocking=True)` for a future boundary it may contain a
+  `scheduled_start` object with schema `softsync.scheduled_start.v1`, command
+  `schedule_start`, `clock`, `target_ns`, `armed`, `overwrite`, and the
+  configured/scheduled timestamp metadata needed by the detached publisher.
+  This object is host-owned status state and must not activate clients.
 - `pending_start.json`: armed but inactive start. Schema
   `softsync.pending_start.v1`, command `set_start`, `clock`, and exactly one of
   `delay_s`/`delay_ns` or `target_ns`.
-- `start.json`: active start signal. Schema `softsync.start.v1`, command
-  `start`, `clock`, `target_ns`, `armed`, and the matching
-  `start_at_monotonic_ns` or `start_at_unix_ns`.
+- `start.json`: active start signal created only when the start boundary is
+  reached. Schema `softsync.start.v1`, command `start`, `clock`, `target_ns`,
+  `armed`, and the matching `start_at_monotonic_ns` or `start_at_unix_ns`.
 - `stop.json`: graceful stop signal. Schema `softsync.stop.v1`, command
   `stop`, optional `reason`.
 - `cancel.json`: abortive signal. Schema `softsync.cancel.v1`, command
@@ -284,6 +304,7 @@ exist; only host APIs create sync ID folders.
 softsync prepare experiment-a
 softsync set-start experiment-a --delay 0.5
 softsync start experiment-a
+softsync start experiment-a --nonblocking
 softsync wait experiment-a --client-id camera-01
 softsync ready experiment-a camera-01
 softsync active experiment-a camera-01
@@ -301,7 +322,11 @@ softsync remove experiment-a
   `wait_for_clients()`, `stop()`, `cancel()`, or `reset()`.
 - `sync_id` and `client_id` are path-safe names: letters, numbers, `.`, `_`, `-`.
 - Active host start is always `start.json`.
-- `pending_start.json` is host-side state and must not activate clients.
+- `pending_start.json` and `session.json["scheduled_start"]` are host-side state
+  and must not activate clients.
+- `sync_host.start()` blocks for future schedules unless `nonblocking=True` is
+  used; non-blocking mode delegates delayed `start.json` creation to a detached
+  publisher process.
 - `start.json`, `stop.json`, `cancel.json`, and report files are written atomically.
 - Readers must treat a missing `start.json` as "not started yet".
 - The default clock is `monotonic_ns`, intended for one machine and one boot.
