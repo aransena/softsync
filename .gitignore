@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Packaging
+build/
+dist/
+*.whl
+*.tar.gz
+
+# Virtual environments
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
