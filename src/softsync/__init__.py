@@ -1,20 +1,19 @@
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from softsync.core import (
     DEFAULT_ROOT,
     ACTIVE_SCHEMA,
     CANCEL_SCHEMA,
-    CLIENT_STARTED_SCHEMA,
     DONE_SCHEMA,
-    PENDING_START_SCHEMA,
-    SCHEDULED_START_SCHEMA,
+    READINESS_GATE_SCHEMA,
+    START_CONDITION_SCHEMA,
     READY_SCHEMA,
     SESSION_SCHEMA,
     START_SCHEMA,
     STOP_SCHEMA,
+    WAITING_FOR_CLIENTS_SCHEMA,
     Client,
     Coordinator,
-    PendingStart,
     SoftSyncCancelled,
     SoftSyncClockMismatch,
     SoftSyncError,
@@ -30,21 +29,21 @@ from softsync.core import (
 from . import sync_client, sync_host
 
 prepare = sync_host.prepare
-set_start = sync_host.set_start
 start = sync_host.start
 stop = sync_host.stop
+cancel = sync_host.cancel
+reset = sync_host.reset
 remove = sync_host.remove
 get_clients = sync_host.get_clients
-wait_for_clients = sync_host.wait_for_clients
+status = sync_host.status
 sync_ready = sync_client.sync_ready
 sync_active = sync_client.sync_active
-sync_watch = sync_client.sync_watch
-watch_start = sync_client.watch_start
+wait_for_ready_request = sync_client.wait_for_ready_request
+wait_for_start = sync_client.wait_for_start
 watch_stop = sync_client.watch_stop
-async_sync_watch = sync_client.async_sync_watch
-async_watch_start = sync_client.async_watch_start
+async_wait_for_ready_request = sync_client.async_wait_for_ready_request
+async_wait_for_start = sync_client.async_wait_for_start
 async_watch_stop = sync_client.async_watch_stop
-report_start = sync_client.report_start
 sync_done = sync_client.sync_done
 
 __all__ = [
@@ -52,20 +51,20 @@ __all__ = [
     "DEFAULT_ROOT",
     "ACTIVE_SCHEMA",
     "CANCEL_SCHEMA",
-    "CLIENT_STARTED_SCHEMA",
     "DONE_SCHEMA",
-    "PENDING_START_SCHEMA",
-    "SCHEDULED_START_SCHEMA",
+    "READINESS_GATE_SCHEMA",
+    "START_CONDITION_SCHEMA",
     "READY_SCHEMA",
     "SESSION_SCHEMA",
     "START_SCHEMA",
     "STOP_SCHEMA",
-    "async_sync_watch",
-    "async_watch_start",
+    "WAITING_FOR_CLIENTS_SCHEMA",
+    "async_wait_for_ready_request",
+    "async_wait_for_start",
     "async_watch_stop",
+    "cancel",
     "Client",
     "Coordinator",
-    "PendingStart",
     "prepare",
     "SoftSyncCancelled",
     "SoftSyncClockMismatch",
@@ -79,9 +78,9 @@ __all__ = [
     "get_clients",
     "local_boot_id",
     "remove",
-    "report_start",
-    "set_start",
+    "reset",
     "start",
+    "status",
     "stop",
     "sync_active",
     "sync_client",
@@ -89,8 +88,7 @@ __all__ = [
     "sync_host",
     "sync_path",
     "sync_ready",
-    "sync_watch",
-    "wait_for_clients",
-    "watch_start",
+    "wait_for_ready_request",
+    "wait_for_start",
     "watch_stop",
 ]

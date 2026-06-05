@@ -24,35 +24,43 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    prepare = subparsers.add_parser("prepare", help="create sync state without starting")
+    prepare = subparsers.add_parser("prepare", help="configure sync state without starting")
     prepare.add_argument("sync_id")
     prepare.add_argument("--reset", action="store_true")
-
-    set_start = subparsers.add_parser("set-start", help="arm a named start signal")
-    set_start.add_argument("sync_id")
-    set_start.add_argument(
-        "--delay",
-        type=float,
+    prepare.add_argument("--delay-ns", type=int, default=None, help="delay after readiness in ns")
+    prepare.add_argument("--timestamp-ns", type=int, default=None, help="monotonic start timestamp")
+    prepare.add_argument(
+        "--wait-for-n-clients",
+        type=int,
         default=None,
-        help="future start delay in seconds",
+        help="number of ready clients required before start",
     )
-    set_start.add_argument("--target-ns", type=int, default=None, help="exact target timestamp")
-    set_start.add_argument("--clock", choices=["monotonic_ns", "unix_ns"], default="monotonic_ns")
-    set_start.add_argument("--overwrite", action="store_true")
-    set_start.add_argument("--reset", action="store_true")
+    prepare.add_argument(
+        "--wait-for-client",
+        action="append",
+        dest="wait_for_clients",
+        default=None,
+        help="specific client_id required before start; may be repeated",
+    )
 
-    start = subparsers.add_parser("start", help="publish a named start signal")
+    start = subparsers.add_parser("start", help="publish start after prepared conditions")
     start.add_argument("sync_id")
-    start.add_argument("--clock", choices=["monotonic_ns", "unix_ns"], default="monotonic_ns")
-    start.add_argument("--overwrite", action="store_true")
-    start.add_argument("--reset", action="store_true")
-    start.add_argument("--nonblocking", action="store_true")
+    start.add_argument("--verbose", action="store_true")
 
-    wait = subparsers.add_parser("wait", help="watch until a named start signal reaches its target")
+    wait = subparsers.add_parser("wait", help="wait until start.json exists")
     wait.add_argument("sync_id")
     wait.add_argument("--client-id")
     wait.add_argument("--timeout", type=float, default=None)
     wait.add_argument("--poll", type=float, default=0.005, help="fallback poll interval")
+
+    wait_ready = subparsers.add_parser(
+        "wait-ready",
+        help="wait until the host requests ready clients",
+    )
+    wait_ready.add_argument("sync_id")
+    wait_ready.add_argument("--client-id")
+    wait_ready.add_argument("--timeout", type=float, default=None)
+    wait_ready.add_argument("--poll", type=float, default=0.005, help="fallback poll interval")
 
     ready = subparsers.add_parser("ready", help="notify host that one client is ready")
     ready.add_argument("sync_id")
@@ -62,25 +70,25 @@ def _build_parser() -> argparse.ArgumentParser:
     clients.add_argument("sync_id")
     clients.add_argument("--max-age-ns", type=int, default=None, help="maximum report age in ns")
 
-    active = subparsers.add_parser("active", help="notify host that one client is active")
+    active = subparsers.add_parser("active", help="refresh one client's active heartbeat")
     active.add_argument("sync_id")
     active.add_argument("client_id")
 
-    report_start = subparsers.add_parser("report-start", help="report that one client started")
-    report_start.add_argument("sync_id")
-    report_start.add_argument("client_id")
+    done = subparsers.add_parser("done", help="notify host that one client is done")
+    done.add_argument("sync_id")
+    done.add_argument("client_id")
 
-    stop = subparsers.add_parser("stop", help="publish a stop signal")
+    stop = subparsers.add_parser("stop", help="publish a stop signal and clean active state")
     stop.add_argument("sync_id")
     stop.add_argument("--reason", default=None)
     stop.add_argument("--overwrite", action="store_true")
 
-    cancel = subparsers.add_parser("cancel", help="publish a cancel signal")
+    cancel = subparsers.add_parser("cancel", help="publish a cancel signal and clean active state")
     cancel.add_argument("sync_id")
     cancel.add_argument("--reason", default=None)
     cancel.add_argument("--overwrite", action="store_true")
 
-    status = subparsers.add_parser("status", help="print flag status")
+    status = subparsers.add_parser("status", help="print sync status")
     status.add_argument("sync_id")
 
     reset = subparsers.add_parser("reset", help="clear run state for the named sync id")
@@ -97,36 +105,30 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "prepare":
-            _print_json(sync_host.prepare(args.sync_id, root=args.root, reset=args.reset))
-            return 0
-
-        if args.command == "set-start":
-            command = sync_host.set_start(
-                args.sync_id,
-                root=args.root,
-                delay_s=args.delay,
-                target_ns=args.target_ns,
-                clock=args.clock,
-                overwrite=args.overwrite,
-                reset=args.reset,
+            _print_json(
+                sync_host.prepare(
+                    args.sync_id,
+                    root=args.root,
+                    reset=args.reset,
+                    delay_ns=args.delay_ns,
+                    timestamp_ns=args.timestamp_ns,
+                    wait_for_N_clients=args.wait_for_n_clients,
+                    wait_for_clients=args.wait_for_clients,
+                )
             )
-            _print_json(command.payload)
             return 0
 
         if args.command == "start":
             command = sync_host.start(
                 args.sync_id,
                 root=args.root,
-                clock=args.clock,
-                overwrite=args.overwrite,
-                reset=args.reset,
-                nonblocking=args.nonblocking,
+                verbose=args.verbose,
             )
             _print_json(command.payload)
             return 0
 
         if args.command == "wait":
-            command = sync_client.sync_watch(
+            command = sync_client.wait_for_start(
                 args.sync_id,
                 client_id=args.client_id,
                 root=args.root,
@@ -134,6 +136,17 @@ def main(argv: list[str] | None = None) -> int:
                 fallback_poll_interval_s=args.poll,
             )
             _print_json(command.payload)
+            return 0
+
+        if args.command == "wait-ready":
+            payload = sync_client.wait_for_ready_request(
+                args.sync_id,
+                client_id=args.client_id,
+                root=args.root,
+                timeout_s=args.timeout,
+                fallback_poll_interval_s=args.poll,
+            )
+            _print_json(payload)
             return 0
 
         if args.command == "ready":
@@ -152,8 +165,8 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(payload)
             return 0
 
-        if args.command == "report-start":
-            payload = sync_client.report_start(args.sync_id, args.client_id, root=args.root)
+        if args.command == "done":
+            payload = sync_client.sync_done(args.sync_id, args.client_id, root=args.root)
             _print_json(payload)
             return 0
 

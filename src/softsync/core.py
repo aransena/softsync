@@ -6,7 +6,6 @@ import re
 import select
 import shutil
 import socket
-import subprocess
 import sys
 import time
 import uuid
@@ -25,13 +24,13 @@ except ImportError:  # pragma: no cover - exercised only on non-Unix platforms.
 DEFAULT_ROOT = Path("/tmp/softsync")
 
 START_SCHEMA = "softsync.start.v1"
-PENDING_START_SCHEMA = "softsync.pending_start.v1"
-SCHEDULED_START_SCHEMA = "softsync.scheduled_start.v1"
+START_CONDITION_SCHEMA = "softsync.start_condition.v1"
+READINESS_GATE_SCHEMA = "softsync.readiness_gate.v1"
+WAITING_FOR_CLIENTS_SCHEMA = "softsync.waiting_for_clients.v1"
 STOP_SCHEMA = "softsync.stop.v1"
 CANCEL_SCHEMA = "softsync.cancel.v1"
 READY_SCHEMA = "softsync.ready.v1"
 ACTIVE_SCHEMA = "softsync.active.v1"
-CLIENT_STARTED_SCHEMA = "softsync.client_started.v1"
 DONE_SCHEMA = "softsync.done.v1"
 SESSION_SCHEMA = "softsync.session.v1"
 
@@ -59,7 +58,7 @@ class SoftSyncTimeout(SoftSyncError):
 
 
 class SoftSyncCancelled(SoftSyncError):
-    """Raised when a client observes a cancel flag before a start flag."""
+    """Raised when a client observes terminal cancellation before completion."""
 
     def __init__(self, payload: Mapping[str, Any]) -> None:
         self.payload = dict(payload)
@@ -165,28 +164,77 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _read_session_scheduled_start(session_file: Path) -> dict[str, Any] | None:
+def _read_session(session_file: Path) -> dict[str, Any]:
     session = _read_json(session_file)
-    scheduled = session.get("scheduled_start")
-    if scheduled is None:
-        return None
-    if not isinstance(scheduled, dict):
-        raise SoftSyncError(f"{session_file} has invalid scheduled_start")
-    if scheduled.get("schema") != SCHEDULED_START_SCHEMA:
-        raise SoftSyncError(f"{session_file} scheduled_start is not {SCHEDULED_START_SCHEMA}")
-    return dict(scheduled)
+    if session.get("schema") != SESSION_SCHEMA:
+        raise SoftSyncError(f"{session_file} is not a {SESSION_SCHEMA} file")
+    return session
 
 
-def _write_session_scheduled_start(
-    session_file: Path,
-    schedule: Mapping[str, Any] | None,
-) -> None:
-    session = _read_json(session_file)
-    if schedule is None:
-        session.pop("scheduled_start", None)
-    else:
-        session["scheduled_start"] = dict(schedule)
+def _write_session(session_file: Path, session: Mapping[str, Any]) -> None:
     _atomic_write_json(session_file, session)
+
+
+def _read_session_start_condition(session_file: Path) -> dict[str, Any]:
+    session = _read_session(session_file)
+    condition = session.get("start_condition")
+    if condition is None:
+        return {
+            "schema": START_CONDITION_SCHEMA,
+            "type": "immediate",
+            "clock": "monotonic_ns",
+        }
+    if not isinstance(condition, dict):
+        raise SoftSyncError(f"{session_file} has invalid start_condition")
+    if condition.get("schema") != START_CONDITION_SCHEMA:
+        raise SoftSyncError(f"{session_file} start_condition is not {START_CONDITION_SCHEMA}")
+    condition_type = condition.get("type")
+    if condition_type not in {"immediate", "delay_ns", "timestamp_ns"}:
+        raise SoftSyncError(f"{session_file} has unsupported start_condition {condition_type!r}")
+    if condition.get("clock", "monotonic_ns") != "monotonic_ns":
+        raise SoftSyncError(f"{session_file} start_condition clock must be monotonic_ns")
+    return dict(condition)
+
+
+def _read_session_readiness_gate(session_file: Path) -> dict[str, Any] | None:
+    session = _read_session(session_file)
+    gate = session.get("readiness_gate")
+    if gate is None:
+        return None
+    if not isinstance(gate, dict):
+        raise SoftSyncError(f"{session_file} has invalid readiness_gate")
+    if gate.get("schema") != READINESS_GATE_SCHEMA:
+        raise SoftSyncError(f"{session_file} readiness_gate is not {READINESS_GATE_SCHEMA}")
+    wait_for_clients = gate.get("wait_for_clients")
+    wait_for_n_clients = gate.get("wait_for_N_clients")
+    if wait_for_clients is None and wait_for_n_clients is None:
+        raise SoftSyncError(f"{session_file} readiness_gate has no client requirement")
+    if wait_for_clients is not None and wait_for_n_clients is not None:
+        raise SoftSyncError(f"{session_file} readiness_gate has conflicting requirements")
+    if wait_for_clients is not None:
+        if not isinstance(wait_for_clients, list) or not all(
+            isinstance(client_id, str) for client_id in wait_for_clients
+        ):
+            raise SoftSyncError(f"{session_file} readiness_gate wait_for_clients is invalid")
+        if not wait_for_clients:
+            raise SoftSyncError(
+                f"{session_file} readiness_gate wait_for_clients must not be empty"
+            )
+        if len(set(wait_for_clients)) != len(wait_for_clients):
+            raise SoftSyncError(
+                f"{session_file} readiness_gate wait_for_clients has duplicates"
+            )
+    if wait_for_n_clients is not None:
+        if not isinstance(wait_for_n_clients, int) or wait_for_n_clients < 0:
+            raise SoftSyncError(f"{session_file} readiness_gate wait_for_N_clients is invalid")
+    return dict(gate)
+
+
+def _clear_session_run_config(session_file: Path) -> None:
+    session = _read_session(session_file)
+    session.pop("start_condition", None)
+    session.pop("readiness_gate", None)
+    _write_session(session_file, session)
 
 
 def _unlink_if_exists(path: Path) -> None:
@@ -260,10 +308,18 @@ def _clock_now_ns(clock: str) -> int:
     raise ValueError("clock must be 'monotonic_ns' or 'unix_ns'")
 
 
-def _sleep_until_ns(clock: str, target_ns: int, *, cancel_file: Path | None = None) -> None:
+def _sleep_until_ns(
+    clock: str,
+    target_ns: int,
+    *,
+    cancel_file: Path | None = None,
+    stop_file: Path | None = None,
+) -> None:
     while True:
         if cancel_file is not None and cancel_file.exists():
             raise SoftSyncCancelled(_read_json(cancel_file))
+        if stop_file is not None and stop_file.exists():
+            raise SoftSyncStateError(f"{stop_file} already exists")
         remaining_ns = target_ns - _clock_now_ns(clock)
         if remaining_ns <= 0:
             return
@@ -274,121 +330,92 @@ def _sleep_until_ns(clock: str, target_ns: int, *, cancel_file: Path | None = No
             time.sleep(0.0001)
 
 
-def _start_payload_from_schedule(schedule: Mapping[str, Any]) -> dict[str, Any]:
-    clock = str(schedule["clock"])
-    target_ns = int(schedule["target_ns"])
+def _start_payload(
+    *,
+    sync_id: str,
+    coordinator_id: str,
+    target_ns: int,
+    start_condition: Mapping[str, Any],
+    readiness_gate: Mapping[str, Any] | None,
+    ready_clients: Sequence[Mapping[str, Any]],
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     issued_at_monotonic_ns = time.monotonic_ns()
-    issued_at_unix_ns = time.time_ns()
     payload: dict[str, Any] = {
         "schema": START_SCHEMA,
         "command": "start",
-        "sync_id": str(schedule["sync_id"]),
-        "coordinator_id": str(schedule.get("coordinator_id") or ""),
-        "clock": clock,
+        "sync_id": sync_id,
+        "coordinator_id": coordinator_id,
+        "clock": "monotonic_ns",
         "target_ns": target_ns,
+        "start_at_monotonic_ns": target_ns,
         "issued_at_monotonic_ns": issued_at_monotonic_ns,
-        "issued_at_unix_ns": issued_at_unix_ns,
-        "armed": bool(schedule.get("armed")),
+        "issued_at_unix_ns": time.time_ns(),
+        "condition": dict(start_condition),
+        "ready_clients": [str(client["client_id"]) for client in ready_clients],
         **_identity(),
     }
-    if clock == "monotonic_ns":
-        payload["start_at_monotonic_ns"] = target_ns
-    else:
-        payload["start_at_unix_ns"] = target_ns
-
-    passthrough_fields = [
-        "delay_s",
-        "delay_ns",
-        "configured_target_ns",
-        "configured_at_monotonic_ns",
-        "configured_at_unix_ns",
-        "metadata",
-        "scheduled_at_monotonic_ns",
-        "scheduled_at_unix_ns",
-    ]
-    for field in passthrough_fields:
-        if field in schedule:
-            payload[field] = schedule[field]
+    if readiness_gate is not None:
+        payload["readiness_gate"] = dict(readiness_gate)
+    if metadata:
+        payload["metadata"] = dict(metadata)
     return payload
 
 
-def _publish_scheduled_start(
-    sync_id: str,
+def _waiting_for_clients_payload(
     *,
-    root: str | os.PathLike[str] | None = None,
-) -> StartSignal:
-    sync_id = validate_name(sync_id, field="sync_id")
-    root_path = Path(root or DEFAULT_ROOT)
-    sync_dir = sync_path(sync_id, root=root_path)
-    session_file = sync_dir / "session.json"
-    start_file = sync_dir / "start.json"
-    pending_start_file = sync_dir / "pending_start.json"
-    cancel_file = sync_dir / "cancel.json"
-
-    while True:
-        if cancel_file.exists():
-            cancel_payload = _read_json(cancel_file)
-            with _sync_lifecycle_lock(root_path, sync_id):
-                _unlink_if_exists(pending_start_file)
-                _write_session_scheduled_start(session_file, None)
-            raise SoftSyncCancelled(cancel_payload)
-        schedule = _read_session_scheduled_start(session_file)
-        if schedule is None:
-            if start_file.exists():
-                return StartSignal.from_payload(_read_json(start_file), path=start_file)
-            raise SoftSyncNotFound(f"{session_file} has no scheduled_start")
-        clock = str(schedule["clock"])
-        target_ns = int(schedule["target_ns"])
-        remaining_ns = target_ns - _clock_now_ns(clock)
-        if remaining_ns <= 0:
-            break
-        time.sleep(min(remaining_ns / 1_000_000_000, _COARSE_SLEEP_MAX_S))
-
-    with _sync_lifecycle_lock(root_path, sync_id):
-        if cancel_file.exists():
-            cancel_payload = _read_json(cancel_file)
-            _write_session_scheduled_start(session_file, None)
-            raise SoftSyncCancelled(cancel_payload)
-        schedule = _read_session_scheduled_start(session_file)
-        if schedule is None:
-            if start_file.exists():
-                return StartSignal.from_payload(_read_json(start_file), path=start_file)
-            raise SoftSyncNotFound(f"{session_file} has no scheduled_start")
-        overwrite = bool(schedule.get("overwrite"))
-        if start_file.exists() and not overwrite:
-            raise SoftSyncStateError(f"{start_file} already exists")
-        payload = _start_payload_from_schedule(schedule)
-        _atomic_write_json(start_file, payload, overwrite=overwrite)
-        _unlink_if_exists(pending_start_file)
-        _write_session_scheduled_start(session_file, None)
-        return StartSignal.from_payload(payload, path=start_file)
-
-
-def _spawn_scheduled_start_publisher(
     sync_id: str,
+    coordinator_id: str,
+    readiness_gate: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema": WAITING_FOR_CLIENTS_SCHEMA,
+        "command": "waiting_for_clients",
+        "sync_id": sync_id,
+        "coordinator_id": coordinator_id,
+        "readiness_gate": dict(readiness_gate),
+        "issued_at_monotonic_ns": time.monotonic_ns(),
+        "issued_at_unix_ns": time.time_ns(),
+        **_identity(),
+    }
+
+
+def _normalise_prepare_args(
     *,
-    root: str | os.PathLike[str] | None = None,
-) -> None:
-    env = os.environ.copy()
-    src_root = str(Path(__file__).resolve().parents[1])
-    current_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        src_root if not current_pythonpath else f"{src_root}{os.pathsep}{current_pythonpath}"
-    )
-    subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "softsync._start_publisher",
-            sync_id,
-            str(Path(root or DEFAULT_ROOT)),
-        ],
-        close_fds=True,
-        env=env,
-        start_new_session=True,
-        stderr=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-    )
+    delay_ns: int | None = None,
+    timestamp_ns: int | None = None,
+    wait_for_N_clients: int | None = None,
+    wait_for_clients: Sequence[str] | None = None,
+) -> tuple[int | None, int | None, int | None, list[str] | None]:
+    if delay_ns is not None and timestamp_ns is not None:
+        raise ValueError("provide delay_ns or timestamp_ns, not both")
+    if wait_for_clients is not None and wait_for_N_clients is not None:
+        raise ValueError("provide wait_for_N_clients or wait_for_clients, not both")
+
+    def non_negative_int(value: int | None, field: str) -> int | None:
+        if value is None:
+            return None
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{field} must be an integer >= 0")
+        if value < 0:
+            raise ValueError(f"{field} must be >= 0")
+        return value
+
+    delay_ns = non_negative_int(delay_ns, "delay_ns")
+    timestamp_ns = non_negative_int(timestamp_ns, "timestamp_ns")
+    wait_for_N_clients = non_negative_int(wait_for_N_clients, "wait_for_N_clients")
+
+    client_ids: list[str] | None = None
+    if wait_for_clients is not None:
+        if isinstance(wait_for_clients, str):
+            raise ValueError("wait_for_clients must be a sequence of client_id strings")
+        client_ids = [validate_name(client_id, field="client_id") for client_id in wait_for_clients]
+        if not client_ids:
+            raise ValueError("wait_for_clients must contain at least one client_id")
+        if len(set(client_ids)) != len(client_ids):
+            raise ValueError("wait_for_clients must not contain duplicate client_ids")
+
+    return delay_ns, timestamp_ns, wait_for_N_clients, client_ids
 
 
 class _DirectoryWatcher:
@@ -458,68 +485,6 @@ class _DirectoryWatcher:
 
 
 @dataclass(frozen=True)
-class PendingStart:
-    """Parsed contents of `/tmp/softsync/<sync_id>/pending_start.json`."""
-
-    sync_id: str
-    clock: str
-    delay_s: float | None
-    target_ns: int | None
-    configured_at_monotonic_ns: int
-    configured_at_unix_ns: int
-    coordinator_id: str
-    path: Path
-    payload: Mapping[str, Any]
-
-    @classmethod
-    def from_payload(cls, payload: Mapping[str, Any], *, path: Path) -> PendingStart:
-        if payload.get("schema") != PENDING_START_SCHEMA:
-            raise SoftSyncError(f"{path} is not a {PENDING_START_SCHEMA} file")
-        clock = payload.get("clock")
-        if clock not in {"monotonic_ns", "unix_ns"}:
-            raise SoftSyncError(f"{path} has unsupported clock {clock!r}")
-
-        delay_s = payload.get("delay_s")
-        target_ns = payload.get("target_ns")
-        if delay_s is None and target_ns is None:
-            raise SoftSyncError(f"{path} must contain delay_s or target_ns")
-        if delay_s is not None and target_ns is not None:
-            raise SoftSyncError(f"{path} must not contain both delay_s and target_ns")
-        if delay_s is not None:
-            delay_s = float(delay_s)
-            if delay_s < 0:
-                raise SoftSyncError(f"{path} has negative delay_s")
-        if target_ns is not None and not isinstance(target_ns, int):
-            raise SoftSyncError(f"{path} has non-integer target_ns")
-
-        return cls(
-            sync_id=str(payload["sync_id"]),
-            clock=str(clock),
-            delay_s=delay_s,
-            target_ns=target_ns,
-            configured_at_monotonic_ns=int(payload["configured_at_monotonic_ns"]),
-            configured_at_unix_ns=int(payload["configured_at_unix_ns"]),
-            coordinator_id=str(payload.get("coordinator_id") or ""),
-            path=path,
-            payload=dict(payload),
-        )
-
-    def resolve_target_ns(
-        self,
-        *,
-        issued_at_monotonic_ns: int,
-        issued_at_unix_ns: int,
-    ) -> int:
-        if self.target_ns is not None:
-            return self.target_ns
-        assert self.delay_s is not None
-        delay_ns = int(self.delay_s * 1_000_000_000)
-        if self.clock == "monotonic_ns":
-            return issued_at_monotonic_ns + delay_ns
-        return issued_at_unix_ns + delay_ns
-
-
-@dataclass(frozen=True)
 class StartSignal:
     """Parsed contents of `/tmp/softsync/<sync_id>/start.json`."""
 
@@ -580,27 +545,6 @@ class StartSignal:
         assert self.start_at_unix_ns is not None
         return self.start_at_unix_ns
 
-    def kwargs(self) -> dict[str, int]:
-        """Return start timestamp kwargs for prepare-start APIs."""
-
-        if self.clock == "monotonic_ns":
-            assert self.start_at_monotonic_ns is not None
-            return {"start_at_monotonic_ns": self.start_at_monotonic_ns}
-        assert self.start_at_unix_ns is not None
-        return {"start_at_unix_ns": self.start_at_unix_ns}
-
-    def sleep_until_start(self) -> None:
-        while True:
-            now_ns = time.monotonic_ns() if self.clock == "monotonic_ns" else time.time_ns()
-            remaining_ns = self.start_at_ns - now_ns
-            if remaining_ns <= 0:
-                return
-            if remaining_ns > _COARSE_SLEEP_SLACK_NS:
-                sleep_ns = remaining_ns - _COARSE_SLEEP_SLACK_NS
-                time.sleep(min(sleep_ns / 1_000_000_000, _COARSE_SLEEP_MAX_S))
-            elif remaining_ns > _FINE_SLEEP_THRESHOLD_NS:
-                time.sleep(0.0001)
-
     def late_by_ns(self) -> int:
         now_ns = time.monotonic_ns() if self.clock == "monotonic_ns" else time.time_ns()
         return max(0, now_ns - self.start_at_ns)
@@ -629,16 +573,16 @@ class Coordinator:
                 self._ensure_session()
 
     @property
-    def pending_start_file(self) -> Path:
-        return self.path / "pending_start.json"
-
-    @property
     def session_file(self) -> Path:
         return self.path / "session.json"
 
     @property
     def start_file(self) -> Path:
         return self.path / "start.json"
+
+    @property
+    def waiting_for_clients_file(self) -> Path:
+        return self.path / "waiting_for_clients.json"
 
     @property
     def cancel_file(self) -> Path:
@@ -657,17 +601,12 @@ class Coordinator:
         return self.path / "active"
 
     @property
-    def started_dir(self) -> Path:
-        return self.path / "started"
-
-    @property
     def done_dir(self) -> Path:
         return self.path / "done"
 
     def _ensure_session(self) -> None:
         self.ready_dir.mkdir(parents=True, exist_ok=True)
         self.active_dir.mkdir(parents=True, exist_ok=True)
-        self.started_dir.mkdir(parents=True, exist_ok=True)
         self.done_dir.mkdir(parents=True, exist_ok=True)
         if not self.session_file.exists():
             try:
@@ -686,23 +625,103 @@ class Coordinator:
             except SoftSyncStateError:
                 pass
 
+    def prepare(
+        self,
+        *,
+        delay_ns: int | None = None,
+        timestamp_ns: int | None = None,
+        wait_for_N_clients: int | None = None,
+        wait_for_clients: Sequence[str] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Configure the next start without publishing the go-signal."""
+
+        delay_ns, timestamp_ns, wait_for_N_clients, client_ids = _normalise_prepare_args(
+            delay_ns=delay_ns,
+            timestamp_ns=timestamp_ns,
+            wait_for_N_clients=wait_for_N_clients,
+            wait_for_clients=wait_for_clients,
+        )
+
+        with _sync_lifecycle_lock(self.root, self.sync_id):
+            if (
+                self.waiting_for_clients_file.exists()
+                or self.start_file.exists()
+                or self.stop_file.exists()
+                or self.cancel_file.exists()
+            ):
+                raise SoftSyncStateError(
+                    f"{self.path} already has run state; call reset() before prepare()"
+                )
+
+            configured_at_monotonic_ns = time.monotonic_ns()
+            condition: dict[str, Any] = {
+                "schema": START_CONDITION_SCHEMA,
+                "clock": "monotonic_ns",
+                "configured_at_monotonic_ns": configured_at_monotonic_ns,
+                "configured_at_unix_ns": time.time_ns(),
+            }
+            if delay_ns is not None:
+                condition["type"] = "delay_ns"
+                condition["delay_ns"] = int(delay_ns)
+            elif timestamp_ns is not None:
+                condition["type"] = "timestamp_ns"
+                condition["timestamp_ns"] = int(timestamp_ns)
+            else:
+                condition["type"] = "immediate"
+            if metadata:
+                condition["metadata"] = dict(metadata)
+
+            gate: dict[str, Any] | None = None
+            if client_ids is not None:
+                gate = {
+                    "schema": READINESS_GATE_SCHEMA,
+                    "wait_for_clients": sorted(client_ids),
+                }
+            elif wait_for_N_clients is not None:
+                gate = {
+                    "schema": READINESS_GATE_SCHEMA,
+                    "wait_for_N_clients": int(wait_for_N_clients),
+                }
+
+            session = _read_session(self.session_file)
+            session["start_condition"] = condition
+            if gate is None:
+                session.pop("readiness_gate", None)
+            else:
+                session["readiness_gate"] = gate
+            _write_session(self.session_file, session)
+            return self.status()
+
     def reset(self) -> None:
         with _sync_lifecycle_lock(self.root, self.sync_id):
             self.path.mkdir(parents=True, exist_ok=True)
             signal_files = [
-                self.pending_start_file,
+                self.waiting_for_clients_file,
                 self.start_file,
                 self.stop_file,
                 self.cancel_file,
             ]
             for path in signal_files:
                 _unlink_if_exists(path)
-            for directory in [self.ready_dir, self.active_dir, self.started_dir, self.done_dir]:
+            for directory in [self.ready_dir, self.active_dir, self.done_dir]:
                 if directory.exists():
                     shutil.rmtree(directory)
                     _fsync_dir(directory.parent)
             self._ensure_session()
-            _write_session_scheduled_start(self.session_file, None)
+            _clear_session_run_config(self.session_file)
+
+    def _clear_report_files(self, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        for path in directory.glob("*.json"):
+            _unlink_if_exists(path)
+
+    def _cleanup_after_terminal(self) -> None:
+        _unlink_if_exists(self.waiting_for_clients_file)
+        _unlink_if_exists(self.start_file)
+        self._clear_report_files(self.ready_dir)
+        self._clear_report_files(self.active_dir)
+        _clear_session_run_config(self.session_file)
 
     def remove(self) -> None:
         with _sync_lifecycle_lock(self.root, self.sync_id):
@@ -710,149 +729,145 @@ class Coordinator:
                 shutil.rmtree(self.path)
                 _fsync_dir(self.root)
 
-    def set_start(
+    def _ready_clients(self) -> list[dict[str, Any]]:
+        return [client for client in self.get_clients() if "ready" in client["states"]]
+
+    def _wait_for_readiness_gate(
         self,
+        gate: Mapping[str, Any] | None,
         *,
-        delay_s: float | None = None,
-        clock: str = "monotonic_ns",
-        target_ns: int | None = None,
-        metadata: Mapping[str, Any] | None = None,
-        overwrite: bool = False,
-    ) -> PendingStart:
-        """Arm a future start boundary without publishing the active start signal."""
+        timestamp_deadline_ns: int | None,
+        verbose: bool,
+        poll_interval_s: float = 0.01,
+    ) -> list[dict[str, Any]]:
+        if gate is None:
+            return []
 
-        with _sync_lifecycle_lock(self.root, self.sync_id):
-            if delay_s is None and target_ns is None:
-                raise ValueError("provide delay_s or target_ns")
-            if delay_s is not None and target_ns is not None:
-                raise ValueError("provide delay_s or target_ns, not both")
-            if delay_s is not None and delay_s < 0:
-                raise ValueError("delay_s must be >= 0")
-            if clock not in {"monotonic_ns", "unix_ns"}:
-                raise ValueError("clock must be 'monotonic_ns' or 'unix_ns'")
-            if self.cancel_file.exists() and not overwrite:
-                raise SoftSyncStateError(f"{self.cancel_file} already exists")
-            if self.start_file.exists() and not overwrite:
-                raise SoftSyncStateError(f"{self.start_file} already exists")
-            scheduled_start = _read_session_scheduled_start(self.session_file)
-            if scheduled_start is not None and not overwrite:
-                raise SoftSyncStateError(f"{self.session_file} already has scheduled_start")
-            if self.pending_start_file.exists() and not overwrite:
-                raise SoftSyncStateError(f"{self.pending_start_file} already exists")
-            if scheduled_start is not None:
-                _write_session_scheduled_start(self.session_file, None)
+        expected_clients = gate.get("wait_for_clients")
+        expected = {
+            validate_name(client_id, field="client_id")
+            for client_id in expected_clients or []
+            if isinstance(client_id, str)
+        }
+        count = gate.get("wait_for_N_clients")
+        if count is not None:
+            count = int(count)
+        if expected and count is not None:
+            raise SoftSyncError("readiness gate cannot mix clients and count")
+        if not expected and count is None:
+            raise SoftSyncError("readiness gate has no requirement")
 
-            payload: dict[str, Any] = {
-                "schema": PENDING_START_SCHEMA,
-                "command": "set_start",
-                "sync_id": self.sync_id,
-                "coordinator_id": self.coordinator_id,
-                "clock": clock,
-                "configured_at_monotonic_ns": time.monotonic_ns(),
-                "configured_at_unix_ns": time.time_ns(),
-                **_identity(),
-            }
-            if delay_s is not None:
-                payload["delay_s"] = float(delay_s)
-                payload["delay_ns"] = int(delay_s * 1_000_000_000)
-            else:
-                assert target_ns is not None
-                payload["target_ns"] = int(target_ns)
-            if metadata:
-                payload["metadata"] = dict(metadata)
-
-            _atomic_write_json(self.pending_start_file, payload, overwrite=overwrite)
-            return PendingStart.from_payload(payload, path=self.pending_start_file)
+        while True:
+            if self.cancel_file.exists():
+                raise SoftSyncCancelled(_read_json(self.cancel_file))
+            if self.stop_file.exists():
+                raise SoftSyncStateError(f"{self.stop_file} already exists")
+            clients = self._ready_clients()
+            clients_by_id = {client["client_id"]: client for client in clients}
+            if expected and expected.issubset(clients_by_id):
+                return [clients_by_id[client_id] for client_id in sorted(expected)]
+            if count is not None and len(clients) >= count:
+                return clients
+            if timestamp_deadline_ns is not None and time.monotonic_ns() > timestamp_deadline_ns:
+                raise SoftSyncStateError(
+                    "timestamp_ns start condition was missed before clients were ready"
+                )
+            if verbose:
+                missing = sorted(expected.difference(clients_by_id)) if expected else []
+                if missing:
+                    print(f"waiting for ready clients: {', '.join(missing)}", file=sys.stderr)
+                elif count is not None:
+                    print(
+                        f"waiting for ready clients: {len(clients)}/{count}",
+                        file=sys.stderr,
+                    )
+            _poll_sleep(None, poll_interval_s)
 
     def start(
         self,
         *,
-        clock: str = "monotonic_ns",
-        metadata: Mapping[str, Any] | None = None,
-        overwrite: bool = False,
-        nonblocking: bool = False,
+        verbose: bool = False,
     ) -> StartSignal:
-        """Publish the active start signal at its target boundary."""
+        """Wait for prepared conditions, then publish the active start signal."""
 
         with _sync_lifecycle_lock(self.root, self.sync_id):
-            if clock not in {"monotonic_ns", "unix_ns"}:
-                raise ValueError("clock must be 'monotonic_ns' or 'unix_ns'")
-            if self.cancel_file.exists() and not overwrite:
+            if self.cancel_file.exists():
                 raise SoftSyncStateError(f"{self.cancel_file} already exists")
-            if self.start_file.exists() and not overwrite:
+            if self.stop_file.exists():
+                raise SoftSyncStateError(f"{self.stop_file} already exists")
+            if self.start_file.exists():
                 raise SoftSyncStateError(f"{self.start_file} already exists")
-            scheduled_start = _read_session_scheduled_start(self.session_file)
-            if scheduled_start is not None and not overwrite:
-                raise SoftSyncStateError(f"{self.session_file} already has scheduled_start")
-
-            pending = (
-                PendingStart.from_payload(
-                    _read_json(self.pending_start_file),
-                    path=self.pending_start_file,
+            if self.waiting_for_clients_file.exists():
+                raise SoftSyncStateError(f"{self.waiting_for_clients_file} already exists")
+            condition = _read_session_start_condition(self.session_file)
+            readiness_gate = _read_session_readiness_gate(self.session_file)
+            if readiness_gate is not None:
+                _atomic_write_json(
+                    self.waiting_for_clients_file,
+                    _waiting_for_clients_payload(
+                        sync_id=self.sync_id,
+                        coordinator_id=self.coordinator_id,
+                        readiness_gate=readiness_gate,
+                    ),
+                    overwrite=False,
                 )
-                if self.pending_start_file.exists()
-                else None
+
+        deadline_ns = (
+            int(condition["timestamp_ns"]) if condition["type"] == "timestamp_ns" else None
+        )
+        try:
+            ready_clients = self._wait_for_readiness_gate(
+                readiness_gate,
+                timestamp_deadline_ns=deadline_ns,
+                verbose=verbose,
             )
-            scheduled_at_monotonic_ns = time.monotonic_ns()
-            scheduled_at_unix_ns = time.time_ns()
-            resolved_clock = pending.clock if pending else clock
-            target_ns = (
-                pending.resolve_target_ns(
-                    issued_at_monotonic_ns=scheduled_at_monotonic_ns,
-                    issued_at_unix_ns=scheduled_at_unix_ns,
+        finally:
+            if readiness_gate is not None:
+                _unlink_if_exists(self.waiting_for_clients_file)
+
+        now_ns = time.monotonic_ns()
+        if condition["type"] == "delay_ns":
+            target_ns = now_ns + int(condition["delay_ns"])
+        elif condition["type"] == "timestamp_ns":
+            target_ns = int(condition["timestamp_ns"])
+            if now_ns > target_ns:
+                raise SoftSyncStateError(
+                    "timestamp_ns start condition was missed before clients were ready"
                 )
-                if pending
-                else (
-                    scheduled_at_monotonic_ns
-                    if resolved_clock == "monotonic_ns"
-                    else scheduled_at_unix_ns
-                )
+        else:
+            target_ns = now_ns
+
+        _sleep_until_ns(
+            "monotonic_ns",
+            target_ns,
+            cancel_file=self.cancel_file,
+            stop_file=self.stop_file,
+        )
+
+        with _sync_lifecycle_lock(self.root, self.sync_id):
+            if self.cancel_file.exists():
+                raise SoftSyncStateError(f"{self.cancel_file} already exists")
+            if self.stop_file.exists():
+                raise SoftSyncStateError(f"{self.stop_file} already exists")
+            if self.start_file.exists():
+                raise SoftSyncStateError(f"{self.start_file} already exists")
+            if self.waiting_for_clients_file.exists():
+                raise SoftSyncStateError(f"{self.waiting_for_clients_file} already exists")
+            payload = _start_payload(
+                sync_id=self.sync_id,
+                coordinator_id=self.coordinator_id,
+                target_ns=target_ns,
+                start_condition=condition,
+                readiness_gate=readiness_gate,
+                ready_clients=ready_clients,
+                metadata=(
+                    condition.get("metadata")
+                    if isinstance(condition.get("metadata"), dict)
+                    else None
+                ),
             )
-
-            schedule: dict[str, Any] = {
-                "schema": SCHEDULED_START_SCHEMA,
-                "command": "schedule_start",
-                "sync_id": self.sync_id,
-                "coordinator_id": self.coordinator_id,
-                "clock": resolved_clock,
-                "target_ns": int(target_ns),
-                "scheduled_at_monotonic_ns": scheduled_at_monotonic_ns,
-                "scheduled_at_unix_ns": scheduled_at_unix_ns,
-                "armed": pending is not None,
-                "overwrite": overwrite,
-                **_identity(),
-            }
-            if pending:
-                if pending.delay_s is not None:
-                    schedule["delay_s"] = pending.delay_s
-                    schedule["delay_ns"] = int(pending.delay_s * 1_000_000_000)
-                else:
-                    schedule["configured_target_ns"] = pending.target_ns
-                if pending.payload.get("metadata"):
-                    schedule["metadata"] = dict(pending.payload["metadata"])
-                schedule["configured_at_monotonic_ns"] = pending.configured_at_monotonic_ns
-                schedule["configured_at_unix_ns"] = pending.configured_at_unix_ns
-            if metadata:
-                merged_metadata = dict(schedule.get("metadata") or {})
-                merged_metadata.update(dict(metadata))
-                schedule["metadata"] = merged_metadata
-
-            target_is_due = target_ns <= _clock_now_ns(resolved_clock)
-            if target_is_due:
-                payload = _start_payload_from_schedule(schedule)
-                _atomic_write_json(self.start_file, payload, overwrite=overwrite)
-                _unlink_if_exists(self.pending_start_file)
-                _write_session_scheduled_start(self.session_file, None)
-                return StartSignal.from_payload(payload, path=self.start_file)
-
-            _write_session_scheduled_start(self.session_file, schedule)
-            _unlink_if_exists(self.pending_start_file)
-            predicted_payload = _start_payload_from_schedule(schedule)
-
-        if nonblocking:
-            _spawn_scheduled_start_publisher(self.sync_id, root=self.root)
-            return StartSignal.from_payload(predicted_payload, path=self.start_file)
-        return _publish_scheduled_start(self.sync_id, root=self.root)
+            _atomic_write_json(self.start_file, payload, overwrite=False)
+            return StartSignal.from_payload(payload, path=self.start_file)
 
     def cancel(
         self,
@@ -879,8 +894,7 @@ class Coordinator:
             if metadata:
                 payload["metadata"] = dict(metadata)
             _atomic_write_json(self.cancel_file, payload, overwrite=overwrite)
-            _unlink_if_exists(self.pending_start_file)
-            _write_session_scheduled_start(self.session_file, None)
+            self._cleanup_after_terminal()
             return payload
 
     def stop(
@@ -908,6 +922,7 @@ class Coordinator:
             if metadata:
                 payload["metadata"] = dict(metadata)
             _atomic_write_json(self.stop_file, payload, overwrite=overwrite)
+            self._cleanup_after_terminal()
             return payload
 
     def _read_client_reports(
@@ -947,7 +962,7 @@ class Coordinator:
         return reports
 
     def get_clients(self, *, max_age_ns: int | None = None) -> list[dict[str, Any]]:
-        """Return clients with recent ready/active/started/done reports."""
+        """Return clients with recent ready/active/done reports."""
 
         if max_age_ns is not None and max_age_ns < 0:
             raise ValueError("max_age_ns must be >= 0")
@@ -960,7 +975,6 @@ class Coordinator:
         report_specs = [
             ("ready", self.ready_dir, "ready_at_monotonic_ns", "ready_at_unix_ns"),
             ("active", self.active_dir, "active_at_monotonic_ns", "active_at_unix_ns"),
-            ("started", self.started_dir, "started_at_monotonic_ns", "started_at_unix_ns"),
             ("done", self.done_dir, "completed_at_monotonic_ns", "completed_at_unix_ns"),
         ]
         for state, directory, monotonic_field, unix_field in report_specs:
@@ -983,47 +997,17 @@ class Coordinator:
                         client["latest_age_ns"] = age_ns
         return [clients[name] for name in sorted(clients)]
 
-    def wait_for_clients(
-        self,
-        client_ids: Sequence[str] | None = None,
-        *,
-        count: int | None = None,
-        max_age_ns: int | None = None,
-        timeout_s: float | None = None,
-        poll_interval_s: float = 0.01,
-    ) -> list[dict[str, Any]]:
-        """Optional barrier: wait for named clients or a minimum ready count."""
-
-        if client_ids is None and count is None:
-            raise ValueError("provide client_ids or count")
-        expected = {validate_name(client_id, field="client_id") for client_id in client_ids or ()}
-        deadline = _deadline(timeout_s)
-        while True:
-            clients = [
-                client
-                for client in self.get_clients(max_age_ns=max_age_ns)
-                if "ready" in client["states"]
-            ]
-            clients_by_id = {client["client_id"]: client for client in clients}
-            if expected and expected.issubset(clients_by_id):
-                return [clients_by_id[client_id] for client_id in sorted(expected)]
-            if count is not None and len(clients) >= count:
-                return clients
-            if deadline is not None and time.monotonic() >= deadline:
-                missing = sorted(expected.difference(clients_by_id)) if expected else []
-                detail = f": {', '.join(missing)}" if missing else ""
-                raise SoftSyncTimeout(f"timed out waiting for ready clients{detail}")
-            _poll_sleep(deadline, poll_interval_s)
-
     def status(self) -> dict[str, Any]:
         if not self.path.exists():
             raise SoftSyncNotFound(f"{self.path} does not exist")
         return {
             "sync_id": self.sync_id,
             "path": str(self.path),
-            "armed": self.pending_start_file.exists(),
+            "start_condition": _read_session_start_condition(self.session_file),
+            "readiness_gate": _read_session_readiness_gate(self.session_file),
+            "waiting_for_clients": self.waiting_for_clients_file.exists(),
             "started": self.start_file.exists(),
-            "scheduled": _read_session_scheduled_start(self.session_file) is not None,
+            "stopped": self.stop_file.exists(),
             "cancelled": self.cancel_file.exists(),
             "clients": self.get_clients(),
         }
@@ -1052,6 +1036,10 @@ class Client:
         return self.path / "start.json"
 
     @property
+    def waiting_for_clients_file(self) -> Path:
+        return self.path / "waiting_for_clients.json"
+
+    @property
     def cancel_file(self) -> Path:
         return self.path / "cancel.json"
 
@@ -1066,10 +1054,6 @@ class Client:
     @property
     def active_file(self) -> Path:
         return self.path / "active" / f"{self.client_id}.json"
-
-    @property
-    def started_file(self) -> Path:
-        return self.path / "started" / f"{self.client_id}.json"
 
     @property
     def done_file(self) -> Path:
@@ -1115,7 +1099,44 @@ class Client:
         _atomic_write_json(self.active_file, payload, create_parents=False)
         return payload
 
-    def watch_start(
+    def wait_for_ready_request(
+        self,
+        *,
+        timeout_s: float | None = None,
+        poll_interval_s: float = 0.005,
+    ) -> dict[str, Any]:
+        self._require_sync_folder()
+        deadline = _deadline(timeout_s)
+        with _DirectoryWatcher(self.path) as watcher:
+            while True:
+                if self.cancel_file.exists():
+                    raise SoftSyncCancelled(_read_json(self.cancel_file))
+                if self.stop_file.exists():
+                    raise SoftSyncCancelled(_read_json(self.stop_file))
+                if self.waiting_for_clients_file.exists():
+                    try:
+                        payload = _read_json(self.waiting_for_clients_file)
+                    except FileNotFoundError:
+                        payload = None
+                    if payload is None:
+                        continue
+                    if payload.get("schema") != WAITING_FOR_CLIENTS_SCHEMA:
+                        raise SoftSyncError(
+                            f"{self.waiting_for_clients_file} is not a "
+                            f"{WAITING_FOR_CLIENTS_SCHEMA} file"
+                        )
+                    return payload
+                if self.start_file.exists():
+                    raise SoftSyncStateError(
+                        f"{self.start_file} already exists before readiness was requested"
+                    )
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise SoftSyncTimeout(
+                        f"timed out waiting for {self.waiting_for_clients_file}"
+                    )
+                watcher.wait(deadline=deadline, fallback_s=poll_interval_s)
+
+    def wait_for_start(
         self,
         *,
         timeout_s: float | None = None,
@@ -1127,6 +1148,8 @@ class Client:
             while True:
                 if self.cancel_file.exists():
                     raise SoftSyncCancelled(_read_json(self.cancel_file))
+                if self.stop_file.exists():
+                    raise SoftSyncCancelled(_read_json(self.stop_file))
                 if self.start_file.exists():
                     return StartSignal.from_payload(
                         _read_json(self.start_file),
@@ -1153,34 +1176,6 @@ class Client:
                 if deadline is not None and time.monotonic() >= deadline:
                     raise SoftSyncTimeout(f"timed out waiting for {self.stop_file}")
                 watcher.wait(deadline=deadline, fallback_s=poll_interval_s)
-
-    def sync_watch(
-        self,
-        *,
-        timeout_s: float | None = None,
-        poll_interval_s: float = 0.005,
-    ) -> StartSignal:
-        signal = self.watch_start(timeout_s=timeout_s, poll_interval_s=poll_interval_s)
-        signal.sleep_until_start()
-        return signal
-
-    def report_start(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        self._require_sync_folder()
-        started_at_monotonic_ns = time.monotonic_ns()
-        started_at_unix_ns = time.time_ns()
-        payload: dict[str, Any] = {
-            "schema": CLIENT_STARTED_SCHEMA,
-            "sync_id": self.sync_id,
-            "client_id": self.client_id,
-            "state": "started",
-            "started_at_monotonic_ns": started_at_monotonic_ns,
-            "started_at_unix_ns": started_at_unix_ns,
-            **_identity(),
-        }
-        if metadata:
-            payload["metadata"] = dict(metadata)
-        _atomic_write_json(self.started_file, payload, create_parents=False)
-        return payload
 
     def sync_done(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self._require_sync_folder()
@@ -1222,23 +1217,29 @@ def client(
     return Client(sync_id, client_id, root=root)
 
 
-def set_start(
+def prepare(
     sync_id: str,
     *,
     root: str | os.PathLike[str] | None = None,
-    delay_s: float | None = None,
-    clock: str = "monotonic_ns",
-    target_ns: int | None = None,
-    metadata: Mapping[str, Any] | None = None,
-    overwrite: bool = False,
     reset: bool = False,
-) -> PendingStart:
-    return Coordinator(sync_id, root=root, reset=reset).set_start(
-        delay_s=delay_s,
-        clock=clock,
-        target_ns=target_ns,
+    delay_ns: int | None = None,
+    timestamp_ns: int | None = None,
+    wait_for_N_clients: int | None = None,
+    wait_for_clients: Sequence[str] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    _normalise_prepare_args(
+        delay_ns=delay_ns,
+        timestamp_ns=timestamp_ns,
+        wait_for_N_clients=wait_for_N_clients,
+        wait_for_clients=wait_for_clients,
+    )
+    return Coordinator(sync_id, root=root, reset=reset).prepare(
+        delay_ns=delay_ns,
+        timestamp_ns=timestamp_ns,
+        wait_for_N_clients=wait_for_N_clients,
+        wait_for_clients=wait_for_clients,
         metadata=metadata,
-        overwrite=overwrite,
     )
 
 
@@ -1246,18 +1247,9 @@ def start(
     sync_id: str,
     *,
     root: str | os.PathLike[str] | None = None,
-    clock: str = "monotonic_ns",
-    metadata: Mapping[str, Any] | None = None,
-    overwrite: bool = False,
-    reset: bool = False,
-    nonblocking: bool = False,
+    verbose: bool = False,
 ) -> StartSignal:
-    return Coordinator(sync_id, root=root, reset=reset).start(
-        clock=clock,
-        metadata=metadata,
-        overwrite=overwrite,
-        nonblocking=nonblocking,
-    )
+    return Coordinator(sync_id, root=root).start(verbose=verbose)
 
 
 def stop(
@@ -1275,7 +1267,7 @@ def stop(
     )
 
 
-def watch_start(
+def wait_for_start(
     sync_id: str,
     *,
     client_id: str | None = None,
@@ -1283,7 +1275,21 @@ def watch_start(
     timeout_s: float | None = None,
     poll_interval_s: float = 0.005,
 ) -> StartSignal:
-    return Client(sync_id, client_id, root=root).watch_start(
+    return Client(sync_id, client_id, root=root).wait_for_start(
+        timeout_s=timeout_s,
+        poll_interval_s=poll_interval_s,
+    )
+
+
+def wait_for_ready_request(
+    sync_id: str,
+    *,
+    client_id: str | None = None,
+    root: str | os.PathLike[str] | None = None,
+    timeout_s: float | None = None,
+    poll_interval_s: float = 0.005,
+) -> dict[str, Any]:
+    return Client(sync_id, client_id, root=root).wait_for_ready_request(
         timeout_s=timeout_s,
         poll_interval_s=poll_interval_s,
     )
@@ -1298,20 +1304,6 @@ def watch_stop(
     poll_interval_s: float = 0.005,
 ) -> dict[str, Any]:
     return Client(sync_id, client_id, root=root).watch_stop(
-        timeout_s=timeout_s,
-        poll_interval_s=poll_interval_s,
-    )
-
-
-def sync_watch(
-    sync_id: str,
-    *,
-    client_id: str | None = None,
-    root: str | os.PathLike[str] | None = None,
-    timeout_s: float | None = None,
-    poll_interval_s: float = 0.005,
-) -> StartSignal:
-    return Client(sync_id, client_id, root=root).sync_watch(
         timeout_s=timeout_s,
         poll_interval_s=poll_interval_s,
     )
@@ -1335,16 +1327,6 @@ def sync_active(
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return Client(sync_id, client_id, root=root).sync_active(metadata=metadata)
-
-
-def report_start(
-    sync_id: str,
-    client_id: str | None = None,
-    *,
-    root: str | os.PathLike[str] | None = None,
-    metadata: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    return Client(sync_id, client_id, root=root).report_start(metadata=metadata)
 
 
 def sync_done(

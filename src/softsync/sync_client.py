@@ -7,48 +7,32 @@ from typing import Any, Mapping
 from softsync.core import Client, StartSignal
 
 
-def sync_watch(
+def wait_for_ready_request(
     sync_id: str,
     *,
     client_id: str | None = None,
     root: str | os.PathLike[str] | None = None,
     timeout_s: float | None = None,
     fallback_poll_interval_s: float = 0.005,
-) -> StartSignal:
-    """Watch `sync_id`, then return when its start boundary arrives."""
+) -> dict[str, Any]:
+    """Wait until the host is actively waiting for ready clients."""
 
-    return Client(sync_id, client_id, root=root).sync_watch(
+    return Client(sync_id, client_id, root=root).wait_for_ready_request(
         timeout_s=timeout_s,
         poll_interval_s=fallback_poll_interval_s,
     )
 
 
-def watch_start(
+async def async_wait_for_ready_request(
     sync_id: str,
     *,
     client_id: str | None = None,
     root: str | os.PathLike[str] | None = None,
     timeout_s: float | None = None,
     fallback_poll_interval_s: float = 0.005,
-) -> StartSignal:
-    """Watch until `start.json` exists, without sleeping to its target time."""
-
-    return Client(sync_id, client_id, root=root).watch_start(
-        timeout_s=timeout_s,
-        poll_interval_s=fallback_poll_interval_s,
-    )
-
-
-async def async_watch_start(
-    sync_id: str,
-    *,
-    client_id: str | None = None,
-    root: str | os.PathLike[str] | None = None,
-    timeout_s: float | None = None,
-    fallback_poll_interval_s: float = 0.005,
-) -> StartSignal:
+) -> dict[str, Any]:
     return await asyncio.to_thread(
-        watch_start,
+        wait_for_ready_request,
         sync_id,
         client_id=client_id,
         root=root,
@@ -57,7 +41,23 @@ async def async_watch_start(
     )
 
 
-async def async_sync_watch(
+def wait_for_start(
+    sync_id: str,
+    *,
+    client_id: str | None = None,
+    root: str | os.PathLike[str] | None = None,
+    timeout_s: float | None = None,
+    fallback_poll_interval_s: float = 0.005,
+) -> StartSignal:
+    """Wait until `start.json` exists, then return immediately."""
+
+    return Client(sync_id, client_id, root=root).wait_for_start(
+        timeout_s=timeout_s,
+        poll_interval_s=fallback_poll_interval_s,
+    )
+
+
+async def async_wait_for_start(
     sync_id: str,
     *,
     client_id: str | None = None,
@@ -66,7 +66,7 @@ async def async_sync_watch(
     fallback_poll_interval_s: float = 0.005,
 ) -> StartSignal:
     return await asyncio.to_thread(
-        sync_watch,
+        wait_for_start,
         sync_id,
         client_id=client_id,
         root=root,
@@ -126,21 +126,9 @@ def sync_active(
     root: str | os.PathLike[str] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Notify the host that this client is alive and monitoring `sync_id`."""
+    """Refresh this client's active heartbeat for `sync_id`."""
 
     return Client(sync_id, client_id, root=root).sync_active(metadata=metadata)
-
-
-def report_start(
-    sync_id: str,
-    client_id: str | None = None,
-    *,
-    root: str | os.PathLike[str] | None = None,
-    metadata: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Report that this client has started work."""
-
-    return Client(sync_id, client_id, root=root).report_start(metadata=metadata)
 
 
 def sync_done(

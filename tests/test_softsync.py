@@ -7,17 +7,25 @@ import time
 import pytest
 
 import softsync
-from softsync.cli import main
 from softsync import sync_client, sync_host
+from softsync.cli import main
 
 
-def test_host_start_and_client_sync_watch_do_not_require_readiness(tmp_path):
-    sync_host.prepare("experiment-a", root=tmp_path)
+def wait_until(predicate, *, timeout_s: float = 1.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError("condition was not satisfied before timeout")
+        time.sleep(0.001)
+
+
+def test_prepare_immediate_start_and_client_wait_do_not_require_readiness(tmp_path):
+    status = sync_host.prepare("experiment-a", root=tmp_path)
     observed: list[softsync.StartSignal] = []
 
     def wait() -> None:
         observed.append(
-            sync_client.sync_watch(
+            sync_client.wait_for_start(
                 "experiment-a",
                 root=tmp_path,
                 timeout_s=1,
@@ -29,79 +37,67 @@ def test_host_start_and_client_sync_watch_do_not_require_readiness(tmp_path):
     thread.start()
     time.sleep(0.02)
 
-    command = sync_host.start("experiment-a", root=tmp_path)
+    signal = sync_host.start("experiment-a", root=tmp_path)
 
     thread.join(timeout=1)
 
+    assert status["start_condition"]["type"] == "immediate"
     assert not thread.is_alive()
-    assert observed == [command]
-    assert command.clock == "monotonic_ns"
-    assert command.start_at_monotonic_ns is not None
+    assert observed == [signal]
+    assert signal.clock == "monotonic_ns"
+    assert signal.start_at_monotonic_ns is not None
     assert (tmp_path / "experiment-a" / "start.json").exists()
     assert list((tmp_path / "experiment-a" / "ready").glob("*.json")) == []
 
 
-def test_host_set_start_requires_delay_or_target(tmp_path):
+def test_prepare_rejects_conflicting_start_conditions_and_readiness_gates(tmp_path):
     with pytest.raises(ValueError):
-        sync_host.set_start("experiment-a", root=tmp_path)
-    with pytest.raises(ValueError):
-        softsync.set_start("experiment-a", root=tmp_path)
-    with pytest.raises(ValueError):
-        sync_host.set_start(
+        sync_host.prepare(
             "experiment-a",
             root=tmp_path,
-            delay_s=0.1,
-            target_ns=time.monotonic_ns(),
+            delay_ns=1,
+            timestamp_ns=time.monotonic_ns(),
+        )
+    with pytest.raises(ValueError):
+        sync_host.prepare(
+            "experiment-a",
+            root=tmp_path,
+            wait_for_N_clients=1,
+            wait_for_clients=["client-a"],
         )
 
 
-def test_set_start_arms_but_does_not_signal_until_start(tmp_path):
-    start_at = time.monotonic_ns() + 80_000_000
+def test_prepare_validates_arguments_before_creating_state(tmp_path):
+    invalid_calls = [
+        lambda: sync_host.prepare(
+            "bad-delay",
+            root=tmp_path,
+            delay_ns=0.5,  # type: ignore[arg-type]
+        ),
+        lambda: sync_host.prepare("empty-list", root=tmp_path, wait_for_clients=[]),
+        lambda: sync_host.prepare(
+            "duplicate-list",
+            root=tmp_path,
+            wait_for_clients=["client-a", "client-a"],
+        ),
+    ]
 
-    pending = sync_host.set_start(
-        "experiment-a",
-        root=tmp_path,
-        clock="monotonic_ns",
-        target_ns=start_at,
-    )
+    for call in invalid_calls:
+        with pytest.raises(ValueError):
+            call()
 
-    assert pending.target_ns == start_at
-    assert (tmp_path / "experiment-a" / "pending_start.json").exists()
-    assert not (tmp_path / "experiment-a" / "start.json").exists()
-
-    with pytest.raises(softsync.SoftSyncTimeout):
-        sync_client.watch_start("experiment-a", root=tmp_path, timeout_s=0.01)
-
-    observed = sync_host.start("experiment-a", root=tmp_path)
-
-    assert observed.start_at_monotonic_ns == start_at
-    assert observed.payload["sync_id"] == "experiment-a"
-    assert observed.payload["target_ns"] == start_at
-    assert observed.payload["armed"] is True
-    assert observed.kwargs() == {"start_at_monotonic_ns": start_at}
-    assert not (tmp_path / "experiment-a" / "pending_start.json").exists()
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_watch_start_returns_boundary_without_sleeping_to_it(tmp_path):
-    start_at = time.monotonic_ns() + 50_000_000
-    sync_host.set_start("experiment-a", root=tmp_path, target_ns=start_at)
-    sync_host.start("experiment-a", root=tmp_path)
-
-    observed = sync_client.watch_start("experiment-a", root=tmp_path, timeout_s=0.1)
-
-    assert observed.start_at_monotonic_ns == start_at
-    assert observed.kwargs() == {"start_at_monotonic_ns": start_at}
-
-
-def test_start_with_future_target_publishes_start_json_at_target(tmp_path):
+def test_delay_ns_start_publishes_start_json_after_delay(tmp_path):
     start_path = tmp_path / "experiment-a" / "start.json"
-    start_at = time.monotonic_ns() + 120_000_000
-    sync_host.set_start("experiment-a", root=tmp_path, target_ns=start_at)
+    sync_host.prepare("experiment-a", root=tmp_path, delay_ns=80_000_000)
     observed: list[softsync.StartSignal] = []
 
     def start() -> None:
         observed.append(sync_host.start("experiment-a", root=tmp_path))
 
+    before = time.monotonic_ns()
     thread = threading.Thread(target=start)
     thread.start()
     time.sleep(0.02)
@@ -113,61 +109,244 @@ def test_start_with_future_target_publishes_start_json_at_target(tmp_path):
 
     assert not thread.is_alive()
     assert start_path.exists()
-    assert observed[0].start_at_monotonic_ns == start_at
+    assert observed[0].start_at_monotonic_ns is not None
+    assert observed[0].start_at_monotonic_ns >= before + 75_000_000
+    assert observed[0].payload["condition"]["delay_ns"] == 80_000_000
 
 
-def test_start_nonblocking_schedules_start_in_session_until_target(tmp_path):
-    session_path = tmp_path / "experiment-a" / "session.json"
+def test_timestamp_ns_start_publishes_start_json_at_timestamp(tmp_path):
     start_path = tmp_path / "experiment-a" / "start.json"
-    sync_host.set_start("experiment-a", root=tmp_path, delay_s=0.1)
+    timestamp_ns = time.monotonic_ns() + 80_000_000
+    sync_host.prepare("experiment-a", root=tmp_path, timestamp_ns=timestamp_ns)
 
-    command = sync_host.start("experiment-a", root=tmp_path, nonblocking=True)
+    signal = sync_host.start("experiment-a", root=tmp_path)
 
-    assert command.payload["schema"] == softsync.START_SCHEMA
-    assert not start_path.exists()
-    session = json.loads(session_path.read_text(encoding="utf-8"))
-    assert session["scheduled_start"]["schema"] == softsync.SCHEDULED_START_SCHEMA
-
-    observed = sync_client.watch_start("experiment-a", root=tmp_path, timeout_s=1)
-
-    assert observed.start_at_monotonic_ns == command.start_at_monotonic_ns
-    for _ in range(100):
-        session = json.loads(session_path.read_text(encoding="utf-8"))
-        if "scheduled_start" not in session:
-            break
-        time.sleep(0.01)
-    assert "scheduled_start" not in session
+    assert start_path.exists()
+    assert signal.start_at_monotonic_ns == timestamp_ns
+    assert signal.payload["condition"]["timestamp_ns"] == timestamp_ns
 
 
-def test_armed_delay_resolves_from_start_call(tmp_path):
-    sync_host.set_start("experiment-a", root=tmp_path, delay_s=0.05)
-    time.sleep(0.02)
-    before_start = time.monotonic_ns()
+def test_wait_for_start_returns_when_start_json_exists_without_extra_sleep(tmp_path):
+    timestamp_ns = time.monotonic_ns() + 50_000_000
+    sync_host.prepare("experiment-a", root=tmp_path, timestamp_ns=timestamp_ns)
+    sync_host.start("experiment-a", root=tmp_path)
+    before_wait = time.monotonic_ns()
 
-    observed = sync_host.start("experiment-a", root=tmp_path)
+    signal = sync_client.wait_for_start("experiment-a", root=tmp_path, timeout_s=0.1)
 
-    assert observed.payload["delay_s"] == 0.05
-    assert observed.start_at_monotonic_ns is not None
-    assert observed.start_at_monotonic_ns >= before_start + 45_000_000
+    assert signal.start_at_monotonic_ns == timestamp_ns
+    assert time.monotonic_ns() - before_wait < 20_000_000
 
 
-def test_readiness_is_optional_but_available(tmp_path):
-    sync = softsync.Coordinator("experiment-a", root=tmp_path)
-
-    sync_client.sync_ready(
+def test_start_waits_for_n_ready_clients_before_delay(tmp_path):
+    sync_host.prepare(
         "experiment-a",
-        "directmuse-left",
+        root=tmp_path,
+        delay_ns=40_000_000,
+        wait_for_N_clients=2,
+    )
+    observed: list[softsync.StartSignal] = []
+
+    def start() -> None:
+        observed.append(sync_host.start("experiment-a", root=tmp_path))
+
+    thread = threading.Thread(target=start)
+    thread.start()
+    time.sleep(0.02)
+
+    assert thread.is_alive()
+    sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
+    time.sleep(0.02)
+    assert thread.is_alive()
+    before_second_ready = time.monotonic_ns()
+    sync_client.sync_ready("experiment-a", "client-b", root=tmp_path)
+
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert observed[0].start_at_monotonic_ns is not None
+    assert observed[0].start_at_monotonic_ns >= before_second_ready + 35_000_000
+    assert observed[0].payload["ready_clients"] == ["client-a", "client-b"]
+
+
+def test_start_waits_for_named_ready_clients(tmp_path):
+    sync_host.prepare(
+        "experiment-a",
+        root=tmp_path,
+        wait_for_clients=["client-b", "client-a"],
+    )
+    observed: list[softsync.StartSignal] = []
+
+    def start() -> None:
+        observed.append(sync_host.start("experiment-a", root=tmp_path))
+
+    thread = threading.Thread(target=start)
+    thread.start()
+    time.sleep(0.02)
+
+    sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
+    time.sleep(0.02)
+    assert thread.is_alive()
+    sync_client.sync_ready("experiment-a", "client-b", root=tmp_path)
+
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert observed[0].payload["readiness_gate"]["wait_for_clients"] == [
+        "client-a",
+        "client-b",
+    ]
+
+
+def test_host_publishes_waiting_for_clients_marker_until_ready(tmp_path):
+    marker_path = tmp_path / "experiment-a" / "waiting_for_clients.json"
+    sync_host.prepare("experiment-a", root=tmp_path, wait_for_clients=["client-a"])
+    observed: list[softsync.StartSignal] = []
+
+    def start() -> None:
+        observed.append(sync_host.start("experiment-a", root=tmp_path))
+
+    thread = threading.Thread(target=start)
+    thread.start()
+    wait_until(marker_path.exists)
+
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    status = sync_host.status("experiment-a", root=tmp_path)
+
+    assert marker["schema"] == softsync.WAITING_FOR_CLIENTS_SCHEMA
+    assert marker["command"] == "waiting_for_clients"
+    assert marker["readiness_gate"]["wait_for_clients"] == ["client-a"]
+    assert status["waiting_for_clients"] is True
+    with pytest.raises(softsync.SoftSyncStateError):
+        sync_host.prepare("experiment-a", root=tmp_path)
+
+    sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert observed
+    assert not marker_path.exists()
+    assert sync_host.status("experiment-a", root=tmp_path)["waiting_for_clients"] is False
+
+
+def test_client_can_wait_for_ready_request_before_reporting_ready(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path, wait_for_clients=["client-a"])
+    observed: list[softsync.StartSignal] = []
+
+    def start() -> None:
+        observed.append(sync_host.start("experiment-a", root=tmp_path))
+
+    thread = threading.Thread(target=start)
+    thread.start()
+
+    request = sync_client.wait_for_ready_request(
+        "experiment-a",
+        client_id="client-a",
+        root=tmp_path,
+        timeout_s=1,
+    )
+    ready = sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
+
+    thread.join(timeout=1)
+
+    assert request["schema"] == softsync.WAITING_FOR_CLIENTS_SCHEMA
+    assert ready["client_id"] == "client-a"
+    assert not thread.is_alive()
+    assert observed[0].payload["ready_clients"] == ["client-a"]
+
+
+def test_stop_clears_waiting_for_clients_marker(tmp_path):
+    marker_path = tmp_path / "experiment-a" / "waiting_for_clients.json"
+    errors: list[str] = []
+    sync_host.prepare("experiment-a", root=tmp_path, wait_for_clients=["client-a"])
+
+    def start() -> None:
+        try:
+            sync_host.start("experiment-a", root=tmp_path)
+        except softsync.SoftSyncStateError as exc:
+            errors.append(str(exc))
+
+    thread = threading.Thread(target=start)
+    thread.start()
+    wait_until(marker_path.exists)
+
+    sync_host.stop("experiment-a", root=tmp_path, reason="not needed")
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert errors
+    assert not marker_path.exists()
+
+
+def test_timestamp_start_raises_if_clients_are_not_ready_before_timestamp(tmp_path):
+    sync_host.prepare(
+        "experiment-a",
+        root=tmp_path,
+        timestamp_ns=time.monotonic_ns() + 30_000_000,
+        wait_for_N_clients=1,
+    )
+
+    with pytest.raises(softsync.SoftSyncStateError):
+        sync_host.start("experiment-a", root=tmp_path)
+
+    assert not (tmp_path / "experiment-a" / "start.json").exists()
+
+
+def test_sync_ready_active_done_are_visible_to_host(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
+    ready = sync_client.sync_ready(
+        "experiment-a",
+        "client-a",
         root=tmp_path,
         metadata={"device": "Muse-1234"},
     )
+    active = sync_client.sync_active("experiment-a", "client-a", root=tmp_path)
+    done = sync_client.sync_done("experiment-a", "client-a", root=tmp_path)
 
-    ready = sync.wait_for_clients(count=1, timeout_s=0.1)
+    clients = sync_host.get_clients("experiment-a", root=tmp_path)
 
-    assert [client["client_id"] for client in ready] == ["directmuse-left"]
-    assert ready[0]["ready"]["metadata"]["device"] == "Muse-1234"
+    assert ready["ready_at_unix_ns"] > 0
+    assert active["state"] == "active"
+    assert done["state"] == "done"
+    assert clients[0]["client_id"] == "client-a"
+    assert clients[0]["states"] == ["ready", "active", "done"]
+    assert clients[0]["ready"]["metadata"]["device"] == "Muse-1234"
 
 
-def test_sync_ready_and_get_clients_filter_stale_files(tmp_path):
+def test_sync_active_refreshes_heartbeat_and_supports_stale_filtering(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
+    first = sync_client.sync_active("experiment-a", "client-a", root=tmp_path)
+    stale = dict(first)
+    stale.update(
+        {
+            "active_at_monotonic_ns": time.monotonic_ns() - 10_000_000_000,
+            "active_at_unix_ns": time.time_ns() - 10_000_000_000,
+        }
+    )
+    active_path = tmp_path / "experiment-a" / "active" / "client-a.json"
+    active_path.write_text(json.dumps(stale), encoding="utf-8")
+
+    stale_clients = sync_host.get_clients(
+        "experiment-a",
+        root=tmp_path,
+        max_age_ns=1_000_000_000,
+    )
+    all_clients = sync_host.get_clients("experiment-a", root=tmp_path)
+    refreshed = sync_client.sync_active("experiment-a", "client-a", root=tmp_path)
+    fresh_clients = sync_host.get_clients(
+        "experiment-a",
+        root=tmp_path,
+        max_age_ns=1_000_000_000,
+    )
+
+    assert stale_clients == []
+    assert all_clients[0]["active"]["age_ns"] >= 1_000_000_000
+    assert refreshed["active_at_monotonic_ns"] > first["active_at_monotonic_ns"]
+    assert fresh_clients[0]["client_id"] == "client-a"
+    assert "active" in fresh_clients[0]["states"]
+
+
+def test_get_clients_filters_stale_files(tmp_path):
     sync_host.prepare("experiment-a", root=tmp_path)
     fresh = sync_client.sync_ready("experiment-a", "fresh", root=tmp_path)
     stale = sync_client.sync_ready("experiment-a", "stale", root=tmp_path)
@@ -193,33 +372,11 @@ def test_sync_ready_and_get_clients_filter_stale_files(tmp_path):
     assert fresh_clients[0]["ready"]["age_ns"] < 1_000_000_000
 
 
-def test_active_and_report_start_are_visible_to_host(tmp_path):
+def test_stop_is_observed_by_client_and_cleans_active_state(tmp_path):
     sync_host.prepare("experiment-a", root=tmp_path)
+    sync_host.start("experiment-a", root=tmp_path)
     sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
     sync_client.sync_active("experiment-a", "client-a", root=tmp_path)
-    started = sync_client.report_start("experiment-a", "client-a", root=tmp_path)
-
-    clients = sync_host.get_clients("experiment-a", root=tmp_path)
-
-    assert clients[0]["client_id"] == "client-a"
-    assert clients[0]["states"] == ["ready", "active", "started"]
-    assert clients[0]["started"]["started_at_unix_ns"] == started["started_at_unix_ns"]
-
-
-def test_sync_done_has_consistent_state_and_is_visible_to_host(tmp_path):
-    sync_host.prepare("experiment-a", root=tmp_path)
-    done = sync_client.sync_done("experiment-a", "client-a", root=tmp_path)
-
-    clients = sync_host.get_clients("experiment-a", root=tmp_path)
-
-    assert done["state"] == "done"
-    assert clients[0]["client_id"] == "client-a"
-    assert clients[0]["states"] == ["done"]
-    assert clients[0]["done"]["state"] == "done"
-
-
-def test_stop_is_observed_by_client(tmp_path):
-    sync_host.prepare("experiment-a", root=tmp_path)
     observed: list[dict[str, object]] = []
 
     def wait() -> None:
@@ -242,20 +399,19 @@ def test_stop_is_observed_by_client(tmp_path):
 
     assert not thread.is_alive()
     assert observed == [stop]
+    assert not (tmp_path / "experiment-a" / "start.json").exists()
+    assert list((tmp_path / "experiment-a" / "ready").glob("*.json")) == []
+    assert list((tmp_path / "experiment-a" / "active").glob("*.json")) == []
+    assert (tmp_path / "experiment-a" / "stop.json").exists()
 
 
-def test_cancel_after_start_interrupts_client_waiting_for_stop(tmp_path):
+def test_cancel_interrupts_client_wait_and_cleans_state(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path, delay_ns=200_000_000)
     observed: list[dict[str, object]] = []
-    sync_host.start("experiment-a", root=tmp_path)
 
     def wait() -> None:
         try:
-            sync_client.watch_stop(
-                "experiment-a",
-                client_id="client-a",
-                root=tmp_path,
-                timeout_s=1,
-            )
+            sync_client.wait_for_start("experiment-a", root=tmp_path, timeout_s=1)
         except softsync.SoftSyncCancelled as exc:
             observed.append(exc.payload)
 
@@ -269,62 +425,61 @@ def test_cancel_after_start_interrupts_client_waiting_for_stop(tmp_path):
 
     assert not thread.is_alive()
     assert observed == [cancel]
+    assert not (tmp_path / "experiment-a" / "start.json").exists()
+    assert (tmp_path / "experiment-a" / "cancel.json").exists()
 
 
-def test_cancel_clears_pending_and_scheduled_start(tmp_path):
-    session_path = tmp_path / "experiment-a" / "session.json"
-    pending_path = tmp_path / "experiment-a" / "pending_start.json"
-    sync_host.set_start("experiment-a", root=tmp_path, delay_s=0.2)
-    sync_host.start("experiment-a", root=tmp_path, nonblocking=True)
+def test_stop_interrupts_delayed_host_start_before_signal(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path, delay_ns=500_000_000)
+    errors: list[str] = []
 
-    cancel = sync_host.cancel("experiment-a", root=tmp_path, reason="abort")
+    def start() -> None:
+        try:
+            sync_host.start("experiment-a", root=tmp_path)
+        except softsync.SoftSyncStateError as exc:
+            errors.append(str(exc))
 
-    session = json.loads(session_path.read_text(encoding="utf-8"))
-    assert "scheduled_start" not in session
-    assert not pending_path.exists()
-    with pytest.raises(softsync.SoftSyncCancelled) as exc:
-        sync_client.watch_start("experiment-a", root=tmp_path, timeout_s=0.1)
-    assert exc.value.payload == cancel
+    thread = threading.Thread(target=start)
+    thread.start()
+    time.sleep(0.02)
+
+    sync_host.stop("experiment-a", root=tmp_path, reason="not needed")
+
+    thread.join(timeout=0.3)
+
+    assert not thread.is_alive()
+    assert errors
+    assert not (tmp_path / "experiment-a" / "start.json").exists()
+    assert (tmp_path / "experiment-a" / "stop.json").exists()
 
 
 def test_reset_clears_state_but_keeps_sync_folder(tmp_path):
-    sync_host.set_start("experiment-a", root=tmp_path, delay_s=0.01)
+    sync_host.prepare("experiment-a", root=tmp_path, delay_ns=1)
     sync_host.start("experiment-a", root=tmp_path)
     sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
+    sync_host.stop("experiment-a", root=tmp_path)
 
     sync_host.reset("experiment-a", root=tmp_path)
 
+    status = sync_host.status("experiment-a", root=tmp_path)
     assert (tmp_path / "experiment-a").exists()
     assert (tmp_path / "experiment-a" / "session.json").exists()
-    assert not (tmp_path / "experiment-a" / "start.json").exists()
-    assert sync_host.get_clients("experiment-a", root=tmp_path) == []
+    assert not (tmp_path / "experiment-a" / "stop.json").exists()
+    assert status["start_condition"]["type"] == "immediate"
+    assert status["clients"] == []
 
 
 def test_remove_deletes_sync_folder(tmp_path):
-    sync_host.start("experiment-a", root=tmp_path)
+    sync_host.prepare("experiment-a", root=tmp_path)
 
     sync_host.remove("experiment-a", root=tmp_path)
 
     assert not (tmp_path / "experiment-a").exists()
 
 
-def test_cancel_interrupts_client_wait(tmp_path):
-    sync_host.cancel("experiment-a", root=tmp_path, reason="setup failed")
-
-    with pytest.raises(softsync.SoftSyncCancelled) as exc:
-        sync_client.sync_watch("experiment-a", root=tmp_path, timeout_s=0.1)
-
-    assert "setup failed" in str(exc.value)
-
-
-def test_get_clients_missing_sync_raises_without_creating_state(tmp_path):
+def test_read_only_missing_sync_raises_without_creating_state(tmp_path):
     with pytest.raises(softsync.SoftSyncNotFound):
         sync_host.get_clients("missing", root=tmp_path)
-
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_status_missing_sync_raises_without_creating_state(tmp_path):
     with pytest.raises(softsync.SoftSyncNotFound):
         sync_host.status("missing", root=tmp_path)
 
@@ -334,12 +489,11 @@ def test_status_missing_sync_raises_without_creating_state(tmp_path):
 @pytest.mark.parametrize(
     "call",
     [
-        lambda root: sync_client.watch_start("missing", root=root, timeout_s=0.01),
-        lambda root: sync_client.sync_watch("missing", root=root, timeout_s=0.01),
+        lambda root: sync_client.wait_for_start("missing", root=root, timeout_s=0.01),
+        lambda root: sync_client.wait_for_ready_request("missing", root=root, timeout_s=0.01),
         lambda root: sync_client.watch_stop("missing", root=root, timeout_s=0.01),
         lambda root: sync_client.sync_ready("missing", "client-a", root=root),
         lambda root: sync_client.sync_active("missing", "client-a", root=root),
-        lambda root: sync_client.report_start("missing", "client-a", root=root),
         lambda root: sync_client.sync_done("missing", "client-a", root=root),
     ],
 )
@@ -352,21 +506,29 @@ def test_client_methods_missing_sync_raise_without_creating_state(tmp_path, call
 
 def test_sync_ids_are_path_safe(tmp_path):
     with pytest.raises(ValueError):
-        sync_host.start("../experiment-a", root=tmp_path)
+        sync_host.prepare("../experiment-a", root=tmp_path)
 
 
-def test_existing_start_requires_reset_or_overwrite(tmp_path):
+def test_top_level_convenience_exports_match_role_modules():
+    assert softsync.cancel is sync_host.cancel
+    assert softsync.reset is sync_host.reset
+    assert softsync.status is sync_host.status
+    assert softsync.wait_for_ready_request is sync_client.wait_for_ready_request
+    assert softsync.wait_for_start is sync_client.wait_for_start
+
+
+def test_existing_start_requires_reset(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
     sync_host.start("experiment-a", root=tmp_path)
 
     with pytest.raises(softsync.SoftSyncStateError):
         sync_host.start("experiment-a", root=tmp_path)
-
-    replacement = sync_host.start("experiment-a", root=tmp_path, overwrite=True)
-
-    assert replacement.payload["schema"] == softsync.START_SCHEMA
+    with pytest.raises(softsync.SoftSyncStateError):
+        sync_host.prepare("experiment-a", root=tmp_path)
 
 
 def test_concurrent_start_has_one_winner(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
     barrier = threading.Barrier(3)
     lock = threading.Lock()
     results: list[str] = []
@@ -396,7 +558,7 @@ def test_concurrent_start_has_one_winner(tmp_path):
 
 
 def test_cli_reports_expected_errors_without_traceback(tmp_path, capsys):
-    exit_code = main(["--root", str(tmp_path), "start", "../bad"])
+    exit_code = main(["--root", str(tmp_path), "prepare", "../bad"])
 
     captured = capsys.readouterr()
 
@@ -404,3 +566,60 @@ def test_cli_reports_expected_errors_without_traceback(tmp_path, capsys):
     assert "sync_id must match" in captured.err
     assert "Traceback" not in captured.err
     assert captured.out == ""
+
+
+def test_cli_prepare_start_wait_flow(tmp_path, capsys):
+    assert main(["--root", str(tmp_path), "prepare", "experiment-a", "--delay-ns", "1"]) == 0
+    assert main(["--root", str(tmp_path), "start", "experiment-a"]) == 0
+    assert main(["--root", str(tmp_path), "wait", "experiment-a"]) == 0
+
+    captured = capsys.readouterr()
+
+    assert '"command": "start"' in captured.out
+
+
+def test_cli_wait_ready_flow(tmp_path, capsys):
+    assert (
+        main(
+            [
+                "--root",
+                str(tmp_path),
+                "prepare",
+                "experiment-a",
+                "--wait-for-client",
+                "client-a",
+            ]
+        )
+        == 0
+    )
+    observed: list[softsync.StartSignal] = []
+
+    def start() -> None:
+        observed.append(sync_host.start("experiment-a", root=tmp_path))
+
+    thread = threading.Thread(target=start)
+    thread.start()
+
+    assert (
+        main(
+            [
+                "--root",
+                str(tmp_path),
+                "wait-ready",
+                "experiment-a",
+                "--client-id",
+                "client-a",
+                "--timeout",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert main(["--root", str(tmp_path), "ready", "experiment-a", "client-a"]) == 0
+
+    thread.join(timeout=1)
+    captured = capsys.readouterr()
+
+    assert not thread.is_alive()
+    assert observed
+    assert '"command": "waiting_for_clients"' in captured.out
