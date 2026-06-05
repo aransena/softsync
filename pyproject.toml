@@ -2,48 +2,6 @@
 requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[project]
-name = "softsync"
-version = "0.2.0"
-description = "A small local file-based soft synchronisation barrier for prepared services."
-readme = "README.md"
-requires-python = ">=3.10"
-license = "MIT"
-license-files = ["LICENSE"]
-authors = [
-  { name = "Aran Sena", email = "aransena@gmail.com" },
-]
-keywords = ["synchronization", "barrier", "recording", "sensors", "coordination"]
-classifiers = [
-  "Development Status :: 3 - Alpha",
-  "Intended Audience :: Developers",
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Operating System :: POSIX",
-  "Topic :: System :: Distributed Computing",
-]
-
-[project.urls]
-Repository = "https://github.com/aransena/softsync"
-
-[project.optional-dependencies]
-dev = [
-  "pytest>=8",
-  "ruff>=0.5",
-]
-
-[project.scripts]
-softsync = "softsync.cli:main"
-
-[tool.setuptools]
-package-dir = { "" = "src" }
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["softsync*"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py310"

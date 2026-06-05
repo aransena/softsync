@@ -75,6 +75,7 @@ def test_prepare_validates_arguments_before_creating_state(tmp_path):
             delay_ns=0.5,  # type: ignore[arg-type]
         ),
         lambda: sync_host.prepare("empty-list", root=tmp_path, wait_for_clients=[]),
+        lambda: sync_host.prepare("zero-count", root=tmp_path, wait_for_N_clients=0),
         lambda: sync_host.prepare(
             "duplicate-list",
             root=tmp_path,
@@ -136,6 +137,32 @@ def test_wait_for_start_returns_when_start_json_exists_without_extra_sleep(tmp_p
 
     assert signal.start_at_monotonic_ns == timestamp_ns
     assert time.monotonic_ns() - before_wait < 20_000_000
+
+
+def test_wait_for_start_can_begin_before_host_prepare(tmp_path):
+    observed: list[softsync.StartSignal] = []
+
+    def wait() -> None:
+        observed.append(
+            sync_client.wait_for_start(
+                "experiment-a",
+                root=tmp_path,
+                timeout_s=1,
+                fallback_poll_interval_s=0.001,
+            )
+        )
+
+    thread = threading.Thread(target=wait)
+    thread.start()
+    time.sleep(0.02)
+
+    sync_host.prepare("experiment-a", root=tmp_path)
+    signal = sync_host.start("experiment-a", root=tmp_path)
+
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert observed == [signal]
 
 
 def test_start_waits_for_n_ready_clients_before_delay(tmp_path):
@@ -230,29 +257,75 @@ def test_host_publishes_waiting_for_clients_marker_until_ready(tmp_path):
 
 
 def test_client_can_wait_for_ready_request_before_reporting_ready(tmp_path):
-    sync_host.prepare("experiment-a", root=tmp_path, wait_for_clients=["client-a"])
     observed: list[softsync.StartSignal] = []
+    requests: list[dict[str, object]] = []
+
+    def wait_ready() -> None:
+        requests.append(
+            sync_client.wait_for_ready_request(
+                "experiment-a",
+                root=tmp_path,
+                timeout_s=1,
+                fallback_poll_interval_s=0.001,
+            )
+        )
 
     def start() -> None:
         observed.append(sync_host.start("experiment-a", root=tmp_path))
 
+    wait_thread = threading.Thread(target=wait_ready)
+    wait_thread.start()
+    time.sleep(0.02)
+
+    sync_host.prepare("experiment-a", root=tmp_path, wait_for_clients=["client-a"])
     thread = threading.Thread(target=start)
     thread.start()
 
-    request = sync_client.wait_for_ready_request(
-        "experiment-a",
-        client_id="client-a",
-        root=tmp_path,
-        timeout_s=1,
-    )
+    wait_thread.join(timeout=1)
     ready = sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
 
     thread.join(timeout=1)
 
-    assert request["schema"] == softsync.WAITING_FOR_CLIENTS_SCHEMA
+    assert not wait_thread.is_alive()
+    assert requests[0]["schema"] == softsync.WAITING_FOR_CLIENTS_SCHEMA
     assert ready["client_id"] == "client-a"
     assert not thread.is_alive()
     assert observed[0].payload["ready_clients"] == ["client-a"]
+
+
+def test_client_can_discover_ready_sync_ids(tmp_path):
+    sync_host.prepare("capture-abc123", root=tmp_path, wait_for_clients=["client-a"])
+    sync_host.prepare("other-run", root=tmp_path, wait_for_clients=["client-b"])
+    observed: list[softsync.StartSignal] = []
+
+    def start(sync_id: str) -> None:
+        observed.append(sync_host.start(sync_id, root=tmp_path))
+
+    threads = [
+        threading.Thread(target=start, args=("capture-abc123",)),
+        threading.Thread(target=start, args=("other-run",)),
+    ]
+    for thread in threads:
+        thread.start()
+
+    wait_until(
+        lambda: sync_client.discover_ready_sync_ids(root=tmp_path)
+        == ["capture-abc123", "other-run"],
+    )
+
+    discovered = sync_client.discover_ready_sync_ids(root=tmp_path)
+    selected_sync_id = next(sync_id for sync_id in discovered if sync_id.startswith("capture-"))
+
+    assert discovered == ["capture-abc123", "other-run"]
+    assert selected_sync_id == "capture-abc123"
+
+    sync_client.sync_ready(selected_sync_id, "client-a", root=tmp_path)
+    sync_client.sync_ready("other-run", "client-b", root=tmp_path)
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert {signal.sync_id for signal in observed} == {"capture-abc123", "other-run"}
 
 
 def test_stop_clears_waiting_for_clients_marker(tmp_path):
@@ -492,12 +565,24 @@ def test_read_only_missing_sync_raises_without_creating_state(tmp_path):
         lambda root: sync_client.wait_for_start("missing", root=root, timeout_s=0.01),
         lambda root: sync_client.wait_for_ready_request("missing", root=root, timeout_s=0.01),
         lambda root: sync_client.watch_stop("missing", root=root, timeout_s=0.01),
+    ],
+)
+def test_client_wait_methods_missing_sync_timeout_without_creating_state(tmp_path, call):
+    with pytest.raises(softsync.SoftSyncTimeout):
+        call(tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
         lambda root: sync_client.sync_ready("missing", "client-a", root=root),
         lambda root: sync_client.sync_active("missing", "client-a", root=root),
         lambda root: sync_client.sync_done("missing", "client-a", root=root),
     ],
 )
-def test_client_methods_missing_sync_raise_without_creating_state(tmp_path, call):
+def test_client_report_methods_missing_sync_raise_without_creating_state(tmp_path, call):
     with pytest.raises(softsync.SoftSyncNotFound):
         call(tmp_path)
 
@@ -513,6 +598,7 @@ def test_top_level_convenience_exports_match_role_modules():
     assert softsync.cancel is sync_host.cancel
     assert softsync.reset is sync_host.reset
     assert softsync.status is sync_host.status
+    assert softsync.discover_ready_sync_ids is sync_client.discover_ready_sync_ids
     assert softsync.wait_for_ready_request is sync_client.wait_for_ready_request
     assert softsync.wait_for_start is sync_client.wait_for_start
 
@@ -605,10 +691,18 @@ def test_cli_wait_ready_flow(tmp_path, capsys):
             [
                 "--root",
                 str(tmp_path),
+                "discover-ready",
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "--root",
+                str(tmp_path),
                 "wait-ready",
                 "experiment-a",
-                "--client-id",
-                "client-a",
                 "--timeout",
                 "1",
             ]
@@ -623,3 +717,4 @@ def test_cli_wait_ready_flow(tmp_path, capsys):
     assert not thread.is_alive()
     assert observed
     assert '"command": "waiting_for_clients"' in captured.out
+    assert '"sync_id": "experiment-a"' in captured.out

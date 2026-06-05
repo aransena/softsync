@@ -36,6 +36,7 @@ reset = sync_host.reset
 remove = sync_host.remove
 get_clients = sync_host.get_clients
 status = sync_host.status
+discover_ready_sync_ids = sync_client.discover_ready_sync_ids
 sync_ready = sync_client.sync_ready
 sync_active = sync_client.sync_active
 wait_for_ready_request = sync_client.wait_for_ready_request
@@ -75,6 +76,7 @@ __all__ = [
     "StartSignal",
     "client",
     "coordinator",
+    "discover_ready_sync_ids",
     "get_clients",
     "local_boot_id",
     "remove",

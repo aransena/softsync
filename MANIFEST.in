@@ -1,5 +1,7 @@
 include README.md
 include LICENSE
 include pyproject.toml
+include setup.cfg
+include setup.py
 recursive-include examples *.md *.py
 recursive-include tests *.py

@@ -1,6 +1,6 @@
 import time
 
-from softsync import SoftSyncCancelled, SoftSyncNotFound, sync_client
+from softsync import SoftSyncCancelled, sync_client
 
 SYNC_ID = "softsync-example"
 CLIENT_ID = "client-01"
@@ -8,9 +8,9 @@ CLIENT_ID = "client-01"
 print("client: waiting for host")
 while True:
     try:
-        sync_client.wait_for_ready_request(SYNC_ID, client_id=CLIENT_ID, timeout_s=1)
+        sync_client.wait_for_ready_request(SYNC_ID, timeout_s=1)
         break
-    except (SoftSyncCancelled, SoftSyncNotFound):
+    except SoftSyncCancelled:
         time.sleep(0.5)
 
 sync_client.sync_ready(SYNC_ID, CLIENT_ID)

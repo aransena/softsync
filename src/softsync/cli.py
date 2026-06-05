@@ -58,9 +58,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="wait until the host requests ready clients",
     )
     wait_ready.add_argument("sync_id")
-    wait_ready.add_argument("--client-id")
     wait_ready.add_argument("--timeout", type=float, default=None)
     wait_ready.add_argument("--poll", type=float, default=0.005, help="fallback poll interval")
+
+    discover_ready = subparsers.add_parser(
+        "discover-ready",
+        help="list sync IDs for hosts currently requesting ready clients",
+    )
 
     ready = subparsers.add_parser("ready", help="notify host that one client is ready")
     ready.add_argument("sync_id")
@@ -141,11 +145,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "wait-ready":
             payload = sync_client.wait_for_ready_request(
                 args.sync_id,
-                client_id=args.client_id,
                 root=args.root,
                 timeout_s=args.timeout,
                 fallback_poll_interval_s=args.poll,
             )
+            _print_json(payload)
+            return 0
+
+        if args.command == "discover-ready":
+            payload = sync_client.discover_ready_sync_ids(root=args.root)
             _print_json(payload)
             return 0
 

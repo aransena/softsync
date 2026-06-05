@@ -4,20 +4,35 @@ import asyncio
 import os
 from typing import Any, Mapping
 
-from softsync.core import Client, StartSignal
+from softsync.core import (
+    Client,
+    StartSignal,
+    discover_ready_sync_ids as _discover_ready_sync_ids,
+    wait_for_ready_request as _wait_for_ready_request,
+)
+
+
+def discover_ready_sync_ids(
+    *,
+    root: str | os.PathLike[str] | None = None,
+) -> list[str]:
+    """Return sync IDs for hosts currently requesting ready clients."""
+
+    return _discover_ready_sync_ids(root=root)
 
 
 def wait_for_ready_request(
     sync_id: str,
     *,
-    client_id: str | None = None,
     root: str | os.PathLike[str] | None = None,
     timeout_s: float | None = None,
     fallback_poll_interval_s: float = 0.005,
 ) -> dict[str, Any]:
     """Wait until the host is actively waiting for ready clients."""
 
-    return Client(sync_id, client_id, root=root).wait_for_ready_request(
+    return _wait_for_ready_request(
+        sync_id,
+        root=root,
         timeout_s=timeout_s,
         poll_interval_s=fallback_poll_interval_s,
     )
@@ -26,7 +41,6 @@ def wait_for_ready_request(
 async def async_wait_for_ready_request(
     sync_id: str,
     *,
-    client_id: str | None = None,
     root: str | os.PathLike[str] | None = None,
     timeout_s: float | None = None,
     fallback_poll_interval_s: float = 0.005,
@@ -34,7 +48,6 @@ async def async_wait_for_ready_request(
     return await asyncio.to_thread(
         wait_for_ready_request,
         sync_id,
-        client_id=client_id,
         root=root,
         timeout_s=timeout_s,
         fallback_poll_interval_s=fallback_poll_interval_s,

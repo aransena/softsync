@@ -90,8 +90,18 @@ sync folder. Clients that only want to report ready on host demand can wait for
 the request first:
 
 ```python
-sync_client.wait_for_ready_request("experiment-a", client_id="camera-01")
+sync_client.wait_for_ready_request("experiment-a")
 sync_client.sync_ready("experiment-a", "camera-01")
+```
+
+If the host uses a generated sync ID, clients can discover active readiness
+requests and choose the matching `sync_id` in their own code:
+
+```python
+sync_ids = sync_client.discover_ready_sync_ids()
+sync_id = next(sync_id for sync_id in sync_ids if sync_id.startswith("capture-"))
+sync_client.wait_for_ready_request(sync_id)
+sync_client.sync_ready(sync_id, "camera-01")
 ```
 
 The host then starts without scheduling arguments:
@@ -118,7 +128,9 @@ start_capture()
 
 `signal` is a `StartSignal` parsed from `start.json`. On Linux, waiting uses
 `inotify` to wake on file changes. If `inotify` is unavailable, it falls back to
-polling.
+polling. Wait-style client calls can be started before the host has prepared the
+sync folder; they wait until the folder and target signal appear or until their
+timeout expires.
 
 Async client form:
 
@@ -140,7 +152,7 @@ When a client should only report ready on host demand, it can wait for the
 host's active readiness request first:
 
 ```python
-sync_client.wait_for_ready_request("experiment-a", client_id="camera-01")
+sync_client.wait_for_ready_request("experiment-a")
 sync_client.sync_ready("experiment-a", "camera-01")
 ```
 
@@ -157,9 +169,10 @@ Done:
 sync_client.sync_done("experiment-a", "camera-01")
 ```
 
-These calls are non-blocking. They write JSON files containing `sync_id`,
-`client_id`, host identity, pid, boot id, and nanosecond timestamps. They raise
-`SoftSyncNotFound` if the host has not already created the sync folder.
+These report calls are non-blocking. They write JSON files containing `sync_id`,
+`client_id`, client process identity, pid, boot id, and nanosecond timestamps.
+They raise `SoftSyncNotFound` if the host has not already created the sync
+folder.
 
 The host can inspect client reports:
 
@@ -284,8 +297,9 @@ Client report messages are replaceable status reports. Each includes `schema`,
 
 Read-only host APIs do not create sync state. `sync_host.get_clients()` and
 `sync_host.status()` raise `SoftSyncNotFound` when the sync folder does not
-exist. Client APIs also raise `SoftSyncNotFound` when the sync folder does not
-exist; only host APIs create sync ID folders.
+exist. Client report APIs also raise `SoftSyncNotFound` when the sync folder
+does not exist. Client wait APIs can wait for a future host-created sync folder,
+but they do not create it; only host APIs create sync ID folders.
 
 ## CLI
 
@@ -296,7 +310,8 @@ softsync prepare experiment-a --timestamp-ns 1234567890
 softsync prepare experiment-a --wait-for-n-clients 2
 softsync prepare experiment-a --wait-for-client camera-01 --wait-for-client camera-02
 softsync start experiment-a
-softsync wait-ready experiment-a --client-id camera-01
+softsync wait-ready experiment-a
+softsync discover-ready
 softsync wait experiment-a --client-id camera-01
 softsync ready experiment-a camera-01
 softsync active experiment-a camera-01

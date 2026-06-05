@@ -225,7 +225,7 @@ def _read_session_readiness_gate(session_file: Path) -> dict[str, Any] | None:
                 f"{session_file} readiness_gate wait_for_clients has duplicates"
             )
     if wait_for_n_clients is not None:
-        if not isinstance(wait_for_n_clients, int) or wait_for_n_clients < 0:
+        if not isinstance(wait_for_n_clients, int) or wait_for_n_clients < 1:
             raise SoftSyncError(f"{session_file} readiness_gate wait_for_N_clients is invalid")
     return dict(gate)
 
@@ -404,6 +404,8 @@ def _normalise_prepare_args(
     delay_ns = non_negative_int(delay_ns, "delay_ns")
     timestamp_ns = non_negative_int(timestamp_ns, "timestamp_ns")
     wait_for_N_clients = non_negative_int(wait_for_N_clients, "wait_for_N_clients")
+    if wait_for_N_clients == 0:
+        raise ValueError("wait_for_N_clients must be >= 1")
 
     client_ids: list[str] | None = None
     if wait_for_clients is not None:
@@ -416,6 +418,40 @@ def _normalise_prepare_args(
             raise ValueError("wait_for_clients must not contain duplicate client_ids")
 
     return delay_ns, timestamp_ns, wait_for_N_clients, client_ids
+
+
+def discover_ready_sync_ids(
+    *,
+    root: str | os.PathLike[str] | None = None,
+) -> list[str]:
+    """Return sync IDs for hosts currently requesting ready clients."""
+
+    root_path = Path(root or DEFAULT_ROOT)
+    if not root_path.is_dir():
+        return []
+
+    discovered: list[str] = []
+    for sync_dir in sorted(root_path.iterdir(), key=lambda path: path.name):
+        if not sync_dir.is_dir() or sync_dir.name == ".locks":
+            continue
+        try:
+            sync_id = validate_name(sync_dir.name, field="sync_id")
+        except ValueError:
+            continue
+
+        request_file = sync_dir / "waiting_for_clients.json"
+        try:
+            payload = _read_json(request_file)
+        except (FileNotFoundError, OSError, json.JSONDecodeError, SoftSyncError):
+            continue
+        if payload.get("schema") != WAITING_FOR_CLIENTS_SCHEMA:
+            continue
+        if payload.get("sync_id") != sync_id:
+            continue
+
+        discovered.append(sync_id)
+
+    return discovered
 
 
 class _DirectoryWatcher:
@@ -1063,6 +1099,17 @@ class Client:
         if not self.path.is_dir():
             raise SoftSyncNotFound(f"{self.path} does not exist")
 
+    def _wait_for_sync_folder(
+        self,
+        *,
+        deadline: float | None,
+        poll_interval_s: float,
+    ) -> None:
+        while not self.path.is_dir():
+            if deadline is not None and time.monotonic() >= deadline:
+                raise SoftSyncTimeout(f"timed out waiting for {self.path} to exist")
+            _poll_sleep(deadline, poll_interval_s)
+
     def sync_ready(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self._require_sync_folder()
         ready_at_monotonic_ns = time.monotonic_ns()
@@ -1105,8 +1152,8 @@ class Client:
         timeout_s: float | None = None,
         poll_interval_s: float = 0.005,
     ) -> dict[str, Any]:
-        self._require_sync_folder()
         deadline = _deadline(timeout_s)
+        self._wait_for_sync_folder(deadline=deadline, poll_interval_s=poll_interval_s)
         with _DirectoryWatcher(self.path) as watcher:
             while True:
                 if self.cancel_file.exists():
@@ -1142,8 +1189,8 @@ class Client:
         timeout_s: float | None = None,
         poll_interval_s: float = 0.005,
     ) -> StartSignal:
-        self._require_sync_folder()
         deadline = _deadline(timeout_s)
+        self._wait_for_sync_folder(deadline=deadline, poll_interval_s=poll_interval_s)
         with _DirectoryWatcher(self.path) as watcher:
             while True:
                 if self.cancel_file.exists():
@@ -1165,8 +1212,8 @@ class Client:
         timeout_s: float | None = None,
         poll_interval_s: float = 0.005,
     ) -> dict[str, Any]:
-        self._require_sync_folder()
         deadline = _deadline(timeout_s)
+        self._wait_for_sync_folder(deadline=deadline, poll_interval_s=poll_interval_s)
         with _DirectoryWatcher(self.path) as watcher:
             while True:
                 if self.cancel_file.exists():
@@ -1284,12 +1331,11 @@ def wait_for_start(
 def wait_for_ready_request(
     sync_id: str,
     *,
-    client_id: str | None = None,
     root: str | os.PathLike[str] | None = None,
     timeout_s: float | None = None,
     poll_interval_s: float = 0.005,
 ) -> dict[str, Any]:
-    return Client(sync_id, client_id, root=root).wait_for_ready_request(
+    return Client(sync_id, root=root).wait_for_ready_request(
         timeout_s=timeout_s,
         poll_interval_s=poll_interval_s,
     )
