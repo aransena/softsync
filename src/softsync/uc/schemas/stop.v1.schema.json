@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "softsync.stop.v1",
+  "title": "softsync stop signal v1",
+  "type": "object",
+  "required": ["schema", "id", "kind", "created_at", "producer", "contracts", "command", "sync_id", "coordinator_id", "issued_at_unix_ns", "timestamp_unix_ns", "lifecycle"],
+  "properties": {
+    "schema": { "const": "softsync.stop.v1" },
+    "id": { "type": "string" },
+    "kind": { "const": "softsync_stop_signal" },
+    "created_at": { "type": "string" },
+    "producer": { "type": "object", "required": ["project"] },
+    "contracts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "contains": { "const": "softsync.profile.local_file_sync.v1" }
+    },
+    "command": { "const": "stop" },
+    "sync_id": { "type": "string" },
+    "coordinator_id": { "type": "string" },
+    "reason": { "type": ["string", "null"] },
+    "issued_at_monotonic_ns": { "type": "integer" },
+    "issued_at_unix_ns": { "type": "integer" },
+    "timestamp_monotonic_ns": { "type": "integer" },
+    "timestamp_unix_ns": { "type": "integer" },
+    "lifecycle": {
+      "type": "object",
+      "required": ["schema", "state", "ended_unix_ns", "closed_cleanly"],
+      "properties": {
+        "schema": { "const": "universal.core.lifecycle.v1" },
+        "state": { "const": "closed" },
+        "closed_cleanly": { "const": true }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

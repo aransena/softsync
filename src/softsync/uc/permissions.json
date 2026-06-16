@@ -1,0 +1,33 @@
+{
+  "schema": "universal.core.permissions.v1",
+  "id": "softsync.permissions",
+  "kind": "permissions",
+  "producer": {
+    "project": "softsync",
+    "version": "0.3.0",
+    "command": null
+  },
+  "contracts": [
+    "universal.core.permissions.v1",
+    "softsync.profile.local_file_sync.v1"
+  ],
+  "scopes": {
+    "sync_root_read": "Read sync folders, lifecycle files, and client reports.",
+    "sync_root_write": "Create sync folders, lock files, lifecycle files, and client reports.",
+    "sync_root_delete": "Remove run state, report files, or entire sync folders."
+  },
+  "resources": {
+    "default_sync_root": "/tmp/softsync",
+    "configured_sync_root": "--root or Python root argument",
+    "lock_files": "<root>/.locks/<sync_id>.lock"
+  },
+  "operations": {
+    "read": ["wait", "wait-ready", "discover-ready", "clients", "status", "validate"],
+    "write": ["prepare", "start", "ready", "active", "done", "stop", "cancel", "reset"],
+    "delete": ["stop", "cancel", "reset", "remove"]
+  },
+  "approval": {
+    "default": "Caller must have local filesystem permissions for the configured root.",
+    "destructive": "reset and remove should be invoked only by the owner of the sync_id."
+  }
+}

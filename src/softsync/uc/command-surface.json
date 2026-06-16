@@ -1,0 +1,122 @@
+{
+  "schema": "universal.core.command.v1",
+  "id": "softsync.commands",
+  "kind": "command_surface",
+  "producer": {
+    "project": "softsync",
+    "version": "0.3.0",
+    "command": "softsync"
+  },
+  "contracts": [
+    "universal.core.command.v1",
+    "universal.cli.tool.v1",
+    "softsync.profile.local_file_sync.v1"
+  ],
+  "commands": {
+    "prepare": {
+      "arguments": ["sync_id"],
+      "flags": ["--root", "--reset", "--delay-ns", "--timestamp-ns", "--wait-for-n-clients", "--wait-for-client"],
+      "outputs": ["session status JSON"],
+      "side_effects": ["create sync folder", "write session.json", "create report directories"]
+    },
+    "start": {
+      "arguments": ["sync_id"],
+      "flags": ["--root", "--verbose"],
+      "outputs": ["start.json payload"],
+      "side_effects": ["write waiting_for_clients.json when needed", "write start.json", "update session lifecycle"]
+    },
+    "wait": {
+      "arguments": ["sync_id"],
+      "flags": ["--root", "--client-id", "--timeout", "--poll"],
+      "outputs": ["start.json payload"],
+      "side_effects": ["none"]
+    },
+    "wait-ready": {
+      "arguments": ["sync_id"],
+      "flags": ["--root", "--timeout", "--poll"],
+      "outputs": ["waiting_for_clients.json payload"],
+      "side_effects": ["none"]
+    },
+    "discover-ready": {
+      "arguments": [],
+      "flags": ["--root"],
+      "outputs": ["array of sync IDs"],
+      "side_effects": ["none"]
+    },
+    "ready": {
+      "arguments": ["sync_id", "client_id"],
+      "flags": ["--root"],
+      "outputs": ["ready report JSON"],
+      "side_effects": ["write ready/<client_id>.json"]
+    },
+    "active": {
+      "arguments": ["sync_id", "client_id"],
+      "flags": ["--root"],
+      "outputs": ["active report JSON"],
+      "side_effects": ["write active/<client_id>.json"]
+    },
+    "done": {
+      "arguments": ["sync_id", "client_id"],
+      "flags": ["--root"],
+      "outputs": ["done report JSON"],
+      "side_effects": ["write done/<client_id>.json"]
+    },
+    "clients": {
+      "arguments": ["sync_id"],
+      "flags": ["--root", "--max-age-ns"],
+      "outputs": ["client report summary array"],
+      "side_effects": ["none"]
+    },
+    "stop": {
+      "arguments": ["sync_id"],
+      "flags": ["--root", "--reason", "--overwrite"],
+      "outputs": ["stop.json payload"],
+      "side_effects": ["write stop.json", "remove start/waiting/ready/active state"]
+    },
+    "cancel": {
+      "arguments": ["sync_id"],
+      "flags": ["--root", "--reason", "--overwrite"],
+      "outputs": ["cancel.json payload"],
+      "side_effects": ["write cancel.json", "remove start/waiting/ready/active state"]
+    },
+    "status": {
+      "arguments": ["sync_id"],
+      "flags": ["--root"],
+      "outputs": ["status JSON"],
+      "side_effects": ["none"]
+    },
+    "validate": {
+      "arguments": ["optional sync_id"],
+      "flags": ["--root"],
+      "outputs": ["softsync.validation.v1 test_run JSON"],
+      "side_effects": ["none"]
+    },
+    "reset": {
+      "arguments": ["sync_id"],
+      "flags": ["--root"],
+      "outputs": [],
+      "side_effects": ["remove run state and reports", "keep sync folder"]
+    },
+    "remove": {
+      "arguments": ["sync_id"],
+      "flags": ["--root"],
+      "outputs": [],
+      "side_effects": ["delete sync folder"]
+    }
+  },
+  "inputs": {
+    "filesystem": "Existing or future sync folder under the configured root.",
+    "configuration": "The --root flag overrides /tmp/softsync."
+  },
+  "outputs": {
+    "stdout": "Machine-readable JSON for commands that return data.",
+    "stderr": "Expected errors and optional verbose waiting progress.",
+    "filesystem": "Runtime protocol files under the configured root."
+  },
+  "exit_codes": {
+    "0": "Success.",
+    "1": "Validation, state, or usage-level softsync error.",
+    "2": "Observed cancellation.",
+    "3": "Timed out while waiting."
+  }
+}

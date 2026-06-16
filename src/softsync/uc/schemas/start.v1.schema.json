@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "softsync.start.v1",
+  "title": "softsync start signal v1",
+  "type": "object",
+  "required": ["schema", "id", "kind", "created_at", "producer", "contracts", "command", "sync_id", "coordinator_id", "clock", "target_ns", "start_at_monotonic_ns", "issued_at_unix_ns", "timestamp_unix_ns", "lifecycle"],
+  "properties": {
+    "schema": { "const": "softsync.start.v1" },
+    "id": { "type": "string" },
+    "kind": { "const": "softsync_start_signal" },
+    "created_at": { "type": "string" },
+    "producer": { "type": "object", "required": ["project"] },
+    "contracts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "contains": { "const": "softsync.profile.local_file_sync.v1" }
+    },
+    "command": { "const": "start" },
+    "sync_id": { "type": "string" },
+    "coordinator_id": { "type": "string" },
+    "clock": { "const": "monotonic_ns" },
+    "target_ns": { "type": "integer" },
+    "start_at_monotonic_ns": { "type": "integer" },
+    "issued_at_monotonic_ns": { "type": "integer" },
+    "issued_at_unix_ns": { "type": "integer" },
+    "timestamp_monotonic_ns": { "type": "integer" },
+    "timestamp_unix_ns": { "type": "integer" },
+    "lifecycle": {
+      "type": "object",
+      "required": ["schema", "state", "started_unix_ns"],
+      "properties": {
+        "schema": { "const": "universal.core.lifecycle.v1" },
+        "state": { "const": "running" }
+      },
+      "additionalProperties": true
+    },
+    "condition": { "type": "object" },
+    "ready_clients": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,36 @@
+{
+  "schema": "softsync.lifecycle_mapping.v1",
+  "id": "softsync.lifecycle",
+  "kind": "lifecycle_mapping",
+  "producer": {
+    "project": "softsync",
+    "version": "0.3.0",
+    "command": null
+  },
+  "contracts": [
+    "universal.core.lifecycle.v1",
+    "softsync.profile.local_file_sync.v1"
+  ],
+  "states": {
+    "created": "session.json exists, but no run has been prepared.",
+    "prepared": "prepare() recorded a start condition and optional readiness gate.",
+    "running": "start.json was published and clients may begin work.",
+    "closed": "stop.json was published and active run state was cleaned.",
+    "cancelled": "cancel.json was published and active run state was cleaned."
+  },
+  "transitions": [
+    "created -> prepared",
+    "prepared -> running",
+    "prepared -> cancelled",
+    "running -> closed",
+    "running -> cancelled",
+    "closed -> created via reset",
+    "cancelled -> created via reset"
+  ],
+  "terminal_states": ["closed", "cancelled"],
+  "write_gates": {
+    "start_signal": "Clients must not begin work until start.json exists.",
+    "ready_active_reports": "ready and active reports are rejected after stop.json or cancel.json exists.",
+    "done_reports": "done reports remain allowed after stop so clients can report graceful completion."
+  }
+}

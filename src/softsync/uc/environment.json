@@ -1,0 +1,37 @@
+{
+  "schema": "universal.core.environment.v1",
+  "id": "softsync.environment",
+  "kind": "environment",
+  "producer": {
+    "project": "softsync",
+    "version": "0.3.0",
+    "command": null
+  },
+  "contracts": [
+    "universal.core.environment.v1",
+    "softsync.profile.local_file_sync.v1"
+  ],
+  "runtime": {
+    "language": "python",
+    "python_requires": ">=3.10",
+    "operating_system": "POSIX",
+    "required_modules": ["fcntl"],
+    "optional_features": {
+      "linux_inotify": "Used for efficient wait notifications when libc inotify is available.",
+      "polling_fallback": "Used when inotify cannot be initialized."
+    }
+  },
+  "dependencies": {
+    "runtime": [],
+    "dev_extra": ["pytest>=8", "ruff>=0.5"],
+    "build_system": ["setuptools>=61", "wheel"]
+  },
+  "hardware": {
+    "requirements": []
+  },
+  "services": {
+    "external": [],
+    "local": ["filesystem"]
+  },
+  "variables": []
+}

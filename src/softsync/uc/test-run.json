@@ -1,0 +1,35 @@
+{
+  "schema": "universal.core.test_run.v1",
+  "id": "softsync.verification",
+  "kind": "test_run",
+  "producer": {
+    "project": "softsync",
+    "version": "0.3.0",
+    "command": "pytest -q"
+  },
+  "contracts": [
+    "universal.core.test_run.v1",
+    "softsync.profile.local_file_sync.v1"
+  ],
+  "inputs": {
+    "fixtures": ["tests"],
+    "configuration": ["temporary pytest roots"],
+    "environment": "environment.json"
+  },
+  "results": {
+    "status": "unknown",
+    "pass_count": 0,
+    "fail_count": 0,
+    "skip_count": 0,
+    "error_count": 0
+  },
+  "files": {
+    "tests": "../../../tests",
+    "examples": "../../../examples"
+  },
+  "validation": {
+    "descriptor_command": "softsync validate",
+    "sync_folder_command": "softsync validate <sync_id>",
+    "unit_command": "pytest -q"
+  }
+}

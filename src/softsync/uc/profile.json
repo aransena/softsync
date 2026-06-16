@@ -1,0 +1,103 @@
+{
+  "schema": "universal.profile.v1",
+  "id": "softsync.profile.local_file_sync.v1",
+  "kind": "profile",
+  "title": "softsync Local File Sync Profile v1",
+  "profile_type": "project_local",
+  "producer": {
+    "project": "softsync",
+    "version": "0.3.0",
+    "command": null
+  },
+  "contracts": [
+    "universal.profile.v1",
+    "universal.core.manifest.v1",
+    "universal.core.lifecycle.v1",
+    "universal.core.command.v1",
+    "universal.core.config.v1",
+    "universal.core.environment.v1",
+    "universal.core.permissions.v1",
+    "universal.core.test_run.v1",
+    "universal.cli.tool.v1"
+  ],
+  "summary": "A single-machine file protocol for prepared clients that report readiness, receive a start signal, heartbeat while active, and observe stop or cancel signals.",
+  "maturity": "candidate",
+  "base_contracts": [
+    "universal.core.manifest.v1",
+    "universal.core.lifecycle.v1",
+    "universal.core.command.v1",
+    "universal.core.config.v1",
+    "universal.core.environment.v1",
+    "universal.core.permissions.v1",
+    "universal.core.test_run.v1",
+    "universal.cli.tool.v1"
+  ],
+  "domain_packs": ["cli-tools"],
+  "required_fields": {
+    "runtime_message": ["schema", "id", "kind", "created_at", "producer", "contracts", "sync_id"],
+    "session": ["schema", "id", "kind", "created_at", "producer", "contracts", "lifecycle", "sync_id"],
+    "client_report": ["schema", "id", "kind", "created_at", "producer", "contracts", "sync_id", "client_id", "state", "timestamp_unix_ns"]
+  },
+  "allowed_values": {
+    "runtime_message.kind": [
+      "softsync_session",
+      "softsync_start_condition",
+      "softsync_readiness_gate",
+      "softsync_readiness_request",
+      "softsync_start_signal",
+      "softsync_stop_signal",
+      "softsync_cancel_signal",
+      "softsync_client_report"
+    ],
+    "client_report.state": ["ready", "active", "done"]
+  },
+  "schemas": [
+    "schemas/session.v1.schema.json",
+    "schemas/start.v1.schema.json",
+    "schemas/stop.v1.schema.json",
+    "schemas/cancel.v1.schema.json",
+    "schemas/waiting-for-clients.v1.schema.json",
+    "schemas/client-report.v1.schema.json"
+  ],
+  "examples": ["../../../examples"],
+  "compatibility": {
+    "requires_candidate_contracts": true,
+    "local_schema_changes_require_minor_version_bump": true,
+    "breaking_runtime_message_changes_require_major_version_bump": true
+  },
+  "integration_points": [
+    {
+      "name": "sync_session",
+      "contracts": ["universal.core.manifest.v1", "universal.core.lifecycle.v1"],
+      "required": true,
+      "description": "session.json identifies the sync folder, producer, lifecycle state, and prepared start/readiness configuration."
+    },
+    {
+      "name": "runtime_messages",
+      "contracts": ["universal.core.lifecycle.v1"],
+      "required": true,
+      "description": "waiting_for_clients.json, start.json, stop.json, cancel.json, and client report files carry UC portable fields and local softsync schemas."
+    },
+    {
+      "name": "validation",
+      "contracts": ["universal.core.test_run.v1"],
+      "required": true,
+      "description": "softsync validate emits a machine-readable test_run result for packaged descriptors or one sync folder."
+    }
+  ],
+  "conformance": {
+    "minimum_level": "portable",
+    "levels": ["shape", "portable", "semantic", "strict-project"],
+    "checks": [
+      "Runtime messages include UC portable identity, producer, contract, timestamp, and lifecycle fields.",
+      "Terminal folders do not retain start, ready, or active files.",
+      "Local message schemas are packaged with the distribution.",
+      "The validate command reports machine-readable pass/fail status."
+    ]
+  },
+  "agent_guidance": [
+    "Preserve existing softsync.*.v1 fields for compatibility and add UC fields additively.",
+    "Treat session.json as the manifest-like object for a sync folder.",
+    "Use softsync validate before claiming UC conformance for a sync folder."
+  ]
+}

@@ -1,0 +1,82 @@
+{
+  "schema": "universal.cli.tool.v1",
+  "id": "softsync.cli",
+  "kind": "cli_tool",
+  "producer": {
+    "project": "softsync",
+    "version": "0.3.0",
+    "command": "softsync"
+  },
+  "contracts": [
+    "universal.cli.tool.v1",
+    "universal.core.command.v1",
+    "universal.core.config.v1",
+    "universal.core.environment.v1",
+    "universal.core.permissions.v1",
+    "universal.core.test_run.v1",
+    "softsync.profile.local_file_sync.v1"
+  ],
+  "commands": {
+    "prepare": "Create or update host-owned sync state without publishing a start signal.",
+    "start": "Wait for prepared conditions and publish start.json.",
+    "wait": "Wait as a client until start.json exists.",
+    "wait-ready": "Wait as a client until the host requests ready clients.",
+    "discover-ready": "List sync IDs with active readiness requests.",
+    "ready": "Write one client ready report.",
+    "active": "Write or refresh one client active heartbeat.",
+    "done": "Write one client completion report.",
+    "clients": "List client reports visible to the host.",
+    "stop": "Publish stop.json and clean active run state.",
+    "cancel": "Publish cancel.json and clean active run state.",
+    "status": "Print host-visible sync status.",
+    "validate": "Validate packaged UC descriptors or one sync directory.",
+    "reset": "Clear run state while keeping the sync folder.",
+    "remove": "Delete the sync folder."
+  },
+  "configuration": {
+    "descriptor": "configuration.json",
+    "root_flag": "--root",
+    "default_root": "/tmp/softsync"
+  },
+  "outputs": {
+    "stdout": "JSON for all reporting commands except reset/remove success.",
+    "stderr": "Human-readable expected error messages.",
+    "files": "/tmp/softsync/<sync_id>/ by default, or --root/<sync_id>/ when configured."
+  },
+  "exit_codes": {
+    "0": "Success.",
+    "1": "Validation, state, or usage-level softsync error.",
+    "2": "Observed cancellation.",
+    "3": "Timed out while waiting."
+  },
+  "input_formats": {
+    "sync_id": "Path-safe single segment matching ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$.",
+    "client_id": "Path-safe single segment matching ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$."
+  },
+  "output_formats": {
+    "runtime_messages": "JSON objects with local softsync.*.v1 schema IDs and UC portable fields.",
+    "validation": "softsync.validation.v1 JSON object implementing universal.core.test_run.v1."
+  },
+  "side_effects": {
+    "prepare": ["filesystem_write"],
+    "start": ["filesystem_write", "filesystem_wait"],
+    "wait": ["filesystem_read", "filesystem_wait"],
+    "wait-ready": ["filesystem_read", "filesystem_wait"],
+    "discover-ready": ["filesystem_read"],
+    "ready": ["filesystem_write"],
+    "active": ["filesystem_write"],
+    "done": ["filesystem_write"],
+    "clients": ["filesystem_read"],
+    "stop": ["filesystem_write", "filesystem_delete"],
+    "cancel": ["filesystem_write", "filesystem_delete"],
+    "status": ["filesystem_read"],
+    "validate": ["filesystem_read"],
+    "reset": ["filesystem_delete", "filesystem_write"],
+    "remove": ["filesystem_delete"]
+  },
+  "composability": {
+    "machine_readable_stdout": true,
+    "progress_to_stderr": true,
+    "quiet_mode": false
+  }
+}

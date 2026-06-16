@@ -1,0 +1,41 @@
+{
+  "schema": "universal.core.config.v1",
+  "id": "softsync.configuration",
+  "kind": "configuration",
+  "producer": {
+    "project": "softsync",
+    "version": "0.3.0",
+    "command": null
+  },
+  "contracts": [
+    "universal.core.config.v1",
+    "softsync.profile.local_file_sync.v1"
+  ],
+  "sources": {
+    "python_arguments": ["root"],
+    "cli_flags": ["--root"],
+    "defaults": {
+      "root": "/tmp/softsync"
+    }
+  },
+  "precedence": ["explicit Python root argument", "CLI --root flag", "default /tmp/softsync"],
+  "fields": {
+    "root": {
+      "type": "path",
+      "required": false,
+      "default": "/tmp/softsync",
+      "description": "Directory that contains per-sync folders and the .locks directory."
+    },
+    "sync_id": {
+      "type": "string",
+      "required": true,
+      "validation": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    },
+    "client_id": {
+      "type": "string",
+      "required": "client report and client wait calls",
+      "validation": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    }
+  },
+  "secrets": []
+}

@@ -94,6 +94,14 @@ def status(
     return Coordinator(sync_id, root=root, create=False).status()
 
 
+def validate(
+    sync_id: str,
+    *,
+    root: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    return Coordinator(sync_id, root=root, create=False).validate()
+
+
 def reset(
     sync_id: str,
     *,

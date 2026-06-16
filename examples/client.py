@@ -1,17 +1,13 @@
-import time
-
 from softsync import SoftSyncCancelled, sync_client
 
 SYNC_ID = "softsync-example"
 CLIENT_ID = "client-01"
 
 print("client: waiting for host")
-while True:
-    try:
-        sync_client.wait_for_ready_request(SYNC_ID, timeout_s=1)
-        break
-    except SoftSyncCancelled:
-        time.sleep(0.5)
+try:
+    sync_client.wait_for_ready_request(SYNC_ID)
+except SoftSyncCancelled as exc:
+    raise SystemExit(f"client: sync cancelled before ready request: {exc}") from exc
 
 sync_client.sync_ready(SYNC_ID, CLIENT_ID)
 print("client: ready")

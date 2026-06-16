@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "softsync.session.v1",
+  "title": "softsync session v1",
+  "type": "object",
+  "required": ["schema", "id", "kind", "created_at", "producer", "contracts", "sync_id", "coordinator_id", "lifecycle"],
+  "properties": {
+    "schema": { "const": "softsync.session.v1" },
+    "id": { "type": "string" },
+    "kind": { "const": "softsync_session" },
+    "created_at": { "type": "string" },
+    "producer": { "type": "object", "required": ["project"] },
+    "contracts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "contains": { "const": "softsync.profile.local_file_sync.v1" }
+    },
+    "sync_id": { "type": "string" },
+    "coordinator_id": { "type": "string" },
+    "created_unix_ns": { "type": "integer" },
+    "created_at_monotonic_ns": { "type": "integer" },
+    "created_at_unix_ns": { "type": "integer" },
+    "lifecycle": {
+      "type": "object",
+      "required": ["schema", "state", "closed_cleanly", "error"],
+      "properties": {
+        "schema": { "const": "universal.core.lifecycle.v1" },
+        "state": { "enum": ["created", "prepared", "running", "closed", "cancelled", "failed"] }
+      },
+      "additionalProperties": true
+    },
+    "start_condition": { "type": "object" },
+    "readiness_gate": { "type": "object" }
+  },
+  "additionalProperties": true
+}

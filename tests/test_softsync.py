@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import runpy
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +19,15 @@ def wait_until(predicate, *, timeout_s: float = 1.0) -> None:
         if time.monotonic() >= deadline:
             raise AssertionError("condition was not satisfied before timeout")
         time.sleep(0.001)
+
+
+def assert_uc_payload(payload: dict[str, object], *, kind: str) -> None:
+    assert payload["kind"] == kind
+    assert isinstance(payload["id"], str)
+    assert isinstance(payload["created_at"], str)
+    assert str(payload["created_at"]).endswith("Z")
+    assert payload["producer"]["project"] == "softsync"  # type: ignore[index]
+    assert softsync.SOFTSYNC_UC_PROFILE in payload["contracts"]  # type: ignore[operator]
 
 
 def test_prepare_immediate_start_and_client_wait_do_not_require_readiness(tmp_path):
@@ -386,6 +397,50 @@ def test_sync_ready_active_done_are_visible_to_host(tmp_path):
     assert clients[0]["ready"]["metadata"]["device"] == "Muse-1234"
 
 
+def test_runtime_payloads_include_uc_portable_fields(tmp_path):
+    status = sync_host.prepare("experiment-a", root=tmp_path, wait_for_clients=["client-a"])
+    session = json.loads((tmp_path / "experiment-a" / "session.json").read_text())
+
+    assert_uc_payload(session, kind="softsync_session")
+    assert session["lifecycle"]["schema"] == softsync.UC_CORE_LIFECYCLE_CONTRACT
+    assert session["lifecycle"]["state"] == "prepared"
+    assert status["lifecycle"]["state"] == "prepared"
+    assert_uc_payload(status["start_condition"], kind="softsync_start_condition")
+    assert_uc_payload(status["readiness_gate"], kind="softsync_readiness_gate")
+
+    observed: list[softsync.StartSignal] = []
+
+    def start() -> None:
+        observed.append(sync_host.start("experiment-a", root=tmp_path))
+
+    thread = threading.Thread(target=start)
+    thread.start()
+    wait_until(lambda: (tmp_path / "experiment-a" / "waiting_for_clients.json").exists())
+    waiting = json.loads(
+        (tmp_path / "experiment-a" / "waiting_for_clients.json").read_text()
+    )
+
+    assert_uc_payload(waiting, kind="softsync_readiness_request")
+    assert waiting["lifecycle"]["state"] == "prepared"
+
+    ready = sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
+    thread.join(timeout=1)
+    active = sync_client.sync_active("experiment-a", "client-a", root=tmp_path)
+    done = sync_client.sync_done("experiment-a", "client-a", root=tmp_path)
+
+    assert not thread.is_alive()
+    assert observed
+    assert_uc_payload(observed[0].payload, kind="softsync_start_signal")
+    assert observed[0].payload["lifecycle"]["state"] == "running"
+    assert sync_host.status("experiment-a", root=tmp_path)["lifecycle"]["state"] == "running"
+    assert_uc_payload(ready, kind="softsync_client_report")
+    assert ready["lifecycle"]["state"] == "prepared"
+    assert_uc_payload(active, kind="softsync_client_report")
+    assert active["lifecycle"]["state"] == "running"
+    assert_uc_payload(done, kind="softsync_client_report")
+    assert done["lifecycle"]["state"] == "closed"
+
+
 def test_sync_active_refreshes_heartbeat_and_supports_stale_filtering(tmp_path):
     sync_host.prepare("experiment-a", root=tmp_path)
     first = sync_client.sync_active("experiment-a", "client-a", root=tmp_path)
@@ -478,6 +533,29 @@ def test_stop_is_observed_by_client_and_cleans_active_state(tmp_path):
     assert (tmp_path / "experiment-a" / "stop.json").exists()
 
 
+def test_ready_active_reports_are_rejected_after_stop_but_done_is_kept(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
+    sync_host.start("experiment-a", root=tmp_path)
+    sync_client.sync_ready("experiment-a", "client-a", root=tmp_path)
+    sync_client.sync_active("experiment-a", "client-a", root=tmp_path)
+
+    sync_host.stop("experiment-a", root=tmp_path, reason="done")
+
+    with pytest.raises(softsync.SoftSyncStateError):
+        sync_client.sync_ready("experiment-a", "late-client", root=tmp_path)
+    with pytest.raises(softsync.SoftSyncStateError):
+        sync_client.sync_active("experiment-a", "late-client", root=tmp_path)
+
+    assert sync_host.status("experiment-a", root=tmp_path)["clients"] == []
+
+    sync_client.sync_done("experiment-a", "client-a", root=tmp_path)
+    clients = sync_host.get_clients("experiment-a", root=tmp_path)
+
+    assert len(clients) == 1
+    assert clients[0]["client_id"] == "client-a"
+    assert clients[0]["states"] == ["done"]
+
+
 def test_cancel_interrupts_client_wait_and_cleans_state(tmp_path):
     sync_host.prepare("experiment-a", root=tmp_path, delay_ns=200_000_000)
     observed: list[dict[str, object]] = []
@@ -500,6 +578,19 @@ def test_cancel_interrupts_client_wait_and_cleans_state(tmp_path):
     assert observed == [cancel]
     assert not (tmp_path / "experiment-a" / "start.json").exists()
     assert (tmp_path / "experiment-a" / "cancel.json").exists()
+
+
+def test_ready_active_reports_are_rejected_after_cancel(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
+
+    sync_host.cancel("experiment-a", root=tmp_path, reason="abort")
+
+    with pytest.raises(softsync.SoftSyncStateError):
+        sync_client.sync_ready("experiment-a", "late-client", root=tmp_path)
+    with pytest.raises(softsync.SoftSyncStateError):
+        sync_client.sync_active("experiment-a", "late-client", root=tmp_path)
+
+    assert sync_host.status("experiment-a", root=tmp_path)["clients"] == []
 
 
 def test_stop_interrupts_delayed_host_start_before_signal(tmp_path):
@@ -598,6 +689,7 @@ def test_top_level_convenience_exports_match_role_modules():
     assert softsync.cancel is sync_host.cancel
     assert softsync.reset is sync_host.reset
     assert softsync.status is sync_host.status
+    assert softsync.validate is sync_host.validate
     assert softsync.discover_ready_sync_ids is sync_client.discover_ready_sync_ids
     assert softsync.wait_for_ready_request is sync_client.wait_for_ready_request
     assert softsync.wait_for_start is sync_client.wait_for_start
@@ -718,3 +810,93 @@ def test_cli_wait_ready_flow(tmp_path, capsys):
     assert observed
     assert '"command": "waiting_for_clients"' in captured.out
     assert '"sync_id": "experiment-a"' in captured.out
+
+
+def test_validate_packaged_uc_descriptors(capsys):
+    assert main(["validate"]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["schema"] == softsync.VALIDATION_SCHEMA
+    assert payload["results"]["status"] == "passed"
+    assert payload["conformance"]["profile"] == softsync.SOFTSYNC_UC_PROFILE
+
+
+def test_validate_sync_folder_and_detects_missing_uc_fields(tmp_path):
+    sync_host.prepare("experiment-a", root=tmp_path)
+    sync_host.start("experiment-a", root=tmp_path)
+
+    valid = sync_host.validate("experiment-a", root=tmp_path)
+
+    assert valid["results"]["status"] == "passed"
+    assert valid["conformance"]["levels"] == ["shape", "portable"]
+
+    start_path = tmp_path / "experiment-a" / "start.json"
+    tampered = json.loads(start_path.read_text(encoding="utf-8"))
+    tampered.pop("id")
+    start_path.write_text(json.dumps(tampered), encoding="utf-8")
+
+    invalid = sync_host.validate("experiment-a", root=tmp_path)
+
+    assert invalid["results"]["status"] == "failed"
+    assert any("missing UC field 'id'" in error for error in invalid["errors"])
+
+
+def test_cli_validate_sync_folder(tmp_path, capsys):
+    sync_host.prepare("experiment-a", root=tmp_path)
+
+    assert main(["--root", str(tmp_path), "validate", "experiment-a"]) == 0
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert payload["schema"] == softsync.VALIDATION_SCHEMA
+    assert payload["results"]["status"] == "passed"
+
+
+def test_client_example_can_start_before_host(tmp_path, monkeypatch):
+    import softsync.core as core
+
+    monkeypatch.setattr(core, "DEFAULT_ROOT", tmp_path)
+    example_path = Path(__file__).resolve().parents[1] / "examples" / "client.py"
+    client_errors: list[BaseException] = []
+    start_errors: list[BaseException] = []
+
+    def run_client() -> None:
+        try:
+            runpy.run_path(str(example_path), run_name="__main__")
+        except BaseException as exc:
+            client_errors.append(exc)
+
+    def run_start() -> None:
+        try:
+            sync_host.start("softsync-example", root=tmp_path)
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    client_thread = threading.Thread(target=run_client)
+    client_thread.start()
+
+    sync_host.prepare(
+        "softsync-example",
+        root=tmp_path,
+        reset=True,
+        wait_for_clients=["client-01"],
+    )
+    start_thread = threading.Thread(target=run_start)
+    start_thread.start()
+    start_thread.join(timeout=2)
+    if start_thread.is_alive():
+        sync_host.cancel("softsync-example", root=tmp_path)
+    start_thread.join(timeout=1)
+
+    assert not start_thread.is_alive()
+    assert start_errors == []
+
+    sync_host.stop("softsync-example", root=tmp_path, reason="example complete")
+    client_thread.join(timeout=2)
+
+    assert not client_thread.is_alive()
+    assert client_errors == []
+    assert sync_host.get_clients("softsync-example", root=tmp_path)[0]["states"] == ["done"]

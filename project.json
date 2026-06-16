@@ -1,0 +1,64 @@
+{
+  "schema": "universal.core.project.v1",
+  "id": "softsync",
+  "kind": "project",
+  "created_at": "2026-06-15T00:00:00Z",
+  "producer": {
+    "project": "softsync",
+    "version": "0.3.0",
+    "command": null
+  },
+  "contracts": [
+    "universal.core.project.v1",
+    "universal.profile.cli_tool_package.v1",
+    "universal.cli.tool.v1",
+    "universal.core.command.v1",
+    "universal.core.config.v1",
+    "universal.core.environment.v1",
+    "universal.core.permissions.v1",
+    "universal.core.test_run.v1",
+    "softsync.profile.local_file_sync.v1"
+  ],
+  "project": {
+    "name": "softsync",
+    "description": "Local file-based synchronization barrier for prepared services.",
+    "version": "0.3.0"
+  },
+  "interfaces": {
+    "python_module": "src/softsync",
+    "cli_tool": "src/softsync/uc/cli-tool.json",
+    "command_surface": "src/softsync/uc/command-surface.json",
+    "configuration": "src/softsync/uc/configuration.json",
+    "environment": "src/softsync/uc/environment.json",
+    "permissions": "src/softsync/uc/permissions.json",
+    "lifecycle": "src/softsync/uc/lifecycle.json",
+    "local_profile": "src/softsync/uc/profile.json"
+  },
+  "commands": {
+    "test": "pytest -q",
+    "compile": "python3 -m py_compile src/softsync/*.py examples/*.py tests/*.py",
+    "package": "python3 setup.py sdist bdist_wheel",
+    "validate_descriptors": "softsync validate",
+    "validate_sync": "softsync validate <sync_id>"
+  },
+  "entry_points": {
+    "cli": "softsync",
+    "host_module": "softsync.sync_host",
+    "client_module": "softsync.sync_client"
+  },
+  "configuration": {
+    "descriptor": "src/softsync/uc/configuration.json",
+    "default_root": "/tmp/softsync"
+  },
+  "artifacts": {
+    "wheel": "dist/softsync-0.3.0-py3-none-any.whl",
+    "sdist": "dist/softsync-0.3.0.tar.gz"
+  },
+  "ownership": {
+    "public_api": ["src/softsync/__init__.py", "src/softsync/sync_host.py", "src/softsync/sync_client.py", "src/softsync/cli.py"],
+    "runtime_protocol": ["src/softsync/core.py", "src/softsync/uc/schemas"],
+    "examples": ["examples"],
+    "tests": ["tests"],
+    "generated": ["build", "dist", "src/softsync.egg-info"]
+  }
+}

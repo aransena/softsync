@@ -26,12 +26,56 @@ pip install /path/to/softsync
 Install from the built wheel:
 
 ```bash
-pip install dist/softsync-0.2.0-py3-none-any.whl
+pip install dist/softsync-0.3.0-py3-none-any.whl
 ```
 
 The package exposes the `softsync` Python module and the `softsync` command.
 Host lifecycle locking uses POSIX `fcntl`, so Windows is not currently
 supported.
+
+## Universal Contracts Compatibility
+
+`softsync` ships Universal Contracts descriptors in `src/softsync/uc/` and a
+repository-level `project.json`. The project implements the
+`universal.profile.cli_tool_package.v1` profile plus the local
+`softsync.profile.local_file_sync.v1` profile.
+
+The runtime file protocol keeps the `softsync.*.v1` schemas as its compatibility
+boundary and adds the Universal Contracts portable spine to every persisted JSON
+message:
+
+- `id`
+- `kind`
+- `created_at`
+- `producer`
+- `contracts`
+- `timestamp_unix_ns` and `timestamp_monotonic_ns` for runtime events
+- `lifecycle` objects using `universal.core.lifecycle.v1` where lifecycle state
+  applies
+
+`session.json` is the manifest-like object for a sync folder. Its lifecycle maps
+host actions onto UC states:
+
+- `created`: sync folder exists, but no run is prepared.
+- `prepared`: `prepare()` recorded the next run configuration.
+- `running`: `start.json` was published.
+- `closed`: `stop.json` was published.
+- `cancelled`: `cancel.json` was published.
+
+Validate the packaged UC descriptors:
+
+```bash
+softsync validate
+```
+
+Validate one sync folder:
+
+```bash
+softsync validate experiment-a
+```
+
+Validation returns `softsync.validation.v1`, a machine-readable
+`universal.core.test_run.v1` result.
 
 ## Examples
 
@@ -259,9 +303,13 @@ ready clients.
 
 ## Message Contracts
 
-All JSON messages include `schema`, `sync_id`, hostname, pid, boot id, and
-nanosecond timestamps. `sync_id` and `client_id` are path-safe single path
-segments: letters, numbers, `.`, `_`, `-`.
+All JSON messages include `schema`, `id`, `kind`, `created_at`, `producer`,
+`contracts`, `sync_id`, hostname, pid, boot id, and nanosecond timestamps.
+Runtime event messages also include `timestamp_unix_ns` and
+`timestamp_monotonic_ns`. Messages with lifecycle meaning include a
+`lifecycle` object with schema `universal.core.lifecycle.v1`. `sync_id` and
+`client_id` are path-safe single path segments: letters, numbers, `.`, `_`,
+`-`.
 
 Host lifecycle messages are serialized with a per-sync file lock under
 `/tmp/softsync/.locks/<sync_id>.lock`. Without overwrite on terminal signals,
@@ -318,6 +366,7 @@ softsync active experiment-a camera-01
 softsync done experiment-a camera-01
 softsync clients experiment-a --max-age-ns 5000000000
 softsync stop experiment-a --reason "capture complete"
+softsync validate experiment-a
 softsync reset experiment-a
 softsync remove experiment-a
 ```

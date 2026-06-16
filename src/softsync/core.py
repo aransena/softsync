@@ -11,8 +11,10 @@ import time
 import uuid
 import ctypes
 import ctypes.util
-from dataclasses import dataclass
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from importlib import resources
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -22,6 +24,20 @@ except ImportError:  # pragma: no cover - exercised only on non-Unix platforms.
     fcntl = None
 
 DEFAULT_ROOT = Path("/tmp/softsync")
+SOFTSYNC_PROJECT = "softsync"
+SOFTSYNC_VERSION = "0.3.0"
+
+UC_CORE_MANIFEST_CONTRACT = "universal.core.manifest.v1"
+UC_CORE_LIFECYCLE_CONTRACT = "universal.core.lifecycle.v1"
+UC_CORE_PROJECT_CONTRACT = "universal.core.project.v1"
+UC_CORE_COMMAND_CONTRACT = "universal.core.command.v1"
+UC_CORE_CONFIG_CONTRACT = "universal.core.config.v1"
+UC_CORE_ENVIRONMENT_CONTRACT = "universal.core.environment.v1"
+UC_CORE_PERMISSIONS_CONTRACT = "universal.core.permissions.v1"
+UC_CORE_TEST_RUN_CONTRACT = "universal.core.test_run.v1"
+UC_CLI_TOOL_CONTRACT = "universal.cli.tool.v1"
+UC_CLI_TOOL_PROFILE = "universal.profile.cli_tool_package.v1"
+SOFTSYNC_UC_PROFILE = "softsync.profile.local_file_sync.v1"
 
 START_SCHEMA = "softsync.start.v1"
 START_CONDITION_SCHEMA = "softsync.start_condition.v1"
@@ -33,6 +49,32 @@ READY_SCHEMA = "softsync.ready.v1"
 ACTIVE_SCHEMA = "softsync.active.v1"
 DONE_SCHEMA = "softsync.done.v1"
 SESSION_SCHEMA = "softsync.session.v1"
+VALIDATION_SCHEMA = "softsync.validation.v1"
+
+RUNTIME_CONTRACTS = [SOFTSYNC_UC_PROFILE]
+SESSION_CONTRACTS = [UC_CORE_MANIFEST_CONTRACT, UC_CORE_LIFECYCLE_CONTRACT, SOFTSYNC_UC_PROFILE]
+LIFECYCLE_SIGNAL_CONTRACTS = [UC_CORE_LIFECYCLE_CONTRACT, SOFTSYNC_UC_PROFILE]
+CLIENT_REPORT_CONTRACTS = [UC_CORE_LIFECYCLE_CONTRACT, SOFTSYNC_UC_PROFILE]
+VALIDATION_CONTRACTS = [UC_CORE_TEST_RUN_CONTRACT, SOFTSYNC_UC_PROFILE]
+
+UC_DESCRIPTOR_FILES = [
+    "profile.json",
+    "cli-tool.json",
+    "command-surface.json",
+    "configuration.json",
+    "environment.json",
+    "permissions.json",
+    "lifecycle.json",
+    "test-run.json",
+]
+UC_SCHEMA_FILES = [
+    "cancel.v1.schema.json",
+    "client-report.v1.schema.json",
+    "session.v1.schema.json",
+    "start.v1.schema.json",
+    "stop.v1.schema.json",
+    "waiting-for-clients.v1.schema.json",
+]
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
@@ -108,6 +150,93 @@ def _identity() -> dict[str, Any]:
         "pid": os.getpid(),
         "boot_id": local_boot_id(),
     }
+
+
+def _iso_utc_from_unix_ns(unix_ns: int) -> str:
+    seconds, nanoseconds = divmod(unix_ns, 1_000_000_000)
+    microseconds = nanoseconds // 1_000
+    return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(
+        microsecond=microseconds
+    ).isoformat().replace("+00:00", "Z")
+
+
+def _producer(command: str | None = None) -> dict[str, Any]:
+    return {
+        "project": SOFTSYNC_PROJECT,
+        "version": SOFTSYNC_VERSION,
+        "command": command,
+    }
+
+
+def _uc_object_fields(
+    *,
+    object_id: str,
+    kind: str,
+    created_unix_ns: int,
+    contracts: Sequence[str],
+    command: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": object_id,
+        "kind": kind,
+        "created_at": _iso_utc_from_unix_ns(created_unix_ns),
+        "producer": _producer(command),
+        "contracts": list(contracts),
+    }
+
+
+def _lifecycle(
+    state: str,
+    *,
+    created_unix_ns: int | None = None,
+    prepared_unix_ns: int | None = None,
+    started_unix_ns: int | None = None,
+    ended_unix_ns: int | None = None,
+    closed_cleanly: bool | None = None,
+    error: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema": UC_CORE_LIFECYCLE_CONTRACT,
+        "state": state,
+        "closed_cleanly": closed_cleanly,
+        "error": dict(error) if error is not None else None,
+    }
+    if created_unix_ns is not None:
+        payload["created_unix_ns"] = created_unix_ns
+    if prepared_unix_ns is not None:
+        payload["prepared_unix_ns"] = prepared_unix_ns
+    if started_unix_ns is not None:
+        payload["started_unix_ns"] = started_unix_ns
+    if ended_unix_ns is not None:
+        payload["ended_unix_ns"] = ended_unix_ns
+    return payload
+
+
+def _session_lifecycle_from_existing(
+    session: Mapping[str, Any],
+    state: str,
+    *,
+    prepared_unix_ns: int | None = None,
+    started_unix_ns: int | None = None,
+    ended_unix_ns: int | None = None,
+    closed_cleanly: bool | None = None,
+    error: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    existing = session.get("lifecycle")
+    created_unix_ns = session.get("created_unix_ns")
+    if not isinstance(created_unix_ns, int) and isinstance(existing, Mapping):
+        existing_created_unix_ns = existing.get("created_unix_ns")
+        if isinstance(existing_created_unix_ns, int):
+            created_unix_ns = existing_created_unix_ns
+    return _lifecycle(
+        state,
+        created_unix_ns=created_unix_ns if isinstance(created_unix_ns, int) else None,
+        prepared_unix_ns=prepared_unix_ns,
+        started_unix_ns=started_unix_ns,
+        ended_unix_ns=ended_unix_ns,
+        closed_cleanly=closed_cleanly,
+        error=error,
+    )
 
 
 def _fsync_dir(path: Path) -> None:
@@ -341,8 +470,16 @@ def _start_payload(
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     issued_at_monotonic_ns = time.monotonic_ns()
+    issued_at_unix_ns = time.time_ns()
     payload: dict[str, Any] = {
         "schema": START_SCHEMA,
+        **_uc_object_fields(
+            object_id=f"{sync_id}:start",
+            kind="softsync_start_signal",
+            created_unix_ns=issued_at_unix_ns,
+            contracts=LIFECYCLE_SIGNAL_CONTRACTS,
+            command="start",
+        ),
         "command": "start",
         "sync_id": sync_id,
         "coordinator_id": coordinator_id,
@@ -350,7 +487,14 @@ def _start_payload(
         "target_ns": target_ns,
         "start_at_monotonic_ns": target_ns,
         "issued_at_monotonic_ns": issued_at_monotonic_ns,
-        "issued_at_unix_ns": time.time_ns(),
+        "issued_at_unix_ns": issued_at_unix_ns,
+        "timestamp_monotonic_ns": issued_at_monotonic_ns,
+        "timestamp_unix_ns": issued_at_unix_ns,
+        "lifecycle": _lifecycle(
+            "running",
+            started_unix_ns=issued_at_unix_ns,
+            closed_cleanly=None,
+        ),
         "condition": dict(start_condition),
         "ready_clients": [str(client["client_id"]) for client in ready_clients],
         **_identity(),
@@ -368,14 +512,30 @@ def _waiting_for_clients_payload(
     coordinator_id: str,
     readiness_gate: Mapping[str, Any],
 ) -> dict[str, Any]:
+    issued_at_monotonic_ns = time.monotonic_ns()
+    issued_at_unix_ns = time.time_ns()
     return {
         "schema": WAITING_FOR_CLIENTS_SCHEMA,
+        **_uc_object_fields(
+            object_id=f"{sync_id}:waiting_for_clients",
+            kind="softsync_readiness_request",
+            created_unix_ns=issued_at_unix_ns,
+            contracts=LIFECYCLE_SIGNAL_CONTRACTS,
+            command="waiting_for_clients",
+        ),
         "command": "waiting_for_clients",
         "sync_id": sync_id,
         "coordinator_id": coordinator_id,
         "readiness_gate": dict(readiness_gate),
-        "issued_at_monotonic_ns": time.monotonic_ns(),
-        "issued_at_unix_ns": time.time_ns(),
+        "issued_at_monotonic_ns": issued_at_monotonic_ns,
+        "issued_at_unix_ns": issued_at_unix_ns,
+        "timestamp_monotonic_ns": issued_at_monotonic_ns,
+        "timestamp_unix_ns": issued_at_unix_ns,
+        "lifecycle": _lifecycle(
+            "prepared",
+            prepared_unix_ns=issued_at_unix_ns,
+            closed_cleanly=None,
+        ),
         **_identity(),
     }
 
@@ -452,6 +612,142 @@ def discover_ready_sync_ids(
         discovered.append(sync_id)
 
     return discovered
+
+
+def _validate_uc_payload(
+    payload: Mapping[str, Any],
+    *,
+    path: str,
+    expected_schema: str | None = None,
+    expected_kind: str | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    if expected_schema is not None and payload.get("schema") != expected_schema:
+        errors.append(f"{path}: expected schema {expected_schema!r}")
+    if expected_kind is not None and payload.get("kind") != expected_kind:
+        errors.append(f"{path}: expected kind {expected_kind!r}")
+    for field in ["schema", "id", "kind", "created_at", "producer", "contracts"]:
+        if field not in payload:
+            errors.append(f"{path}: missing UC field {field!r}")
+    producer = payload.get("producer")
+    if not isinstance(producer, Mapping) or not producer.get("project"):
+        errors.append(f"{path}: producer must include project")
+    contracts = payload.get("contracts")
+    if not isinstance(contracts, list) or not all(
+        isinstance(contract, str) for contract in contracts
+    ):
+        errors.append(f"{path}: contracts must be a list of strings")
+    elif SOFTSYNC_UC_PROFILE not in contracts:
+        errors.append(f"{path}: contracts must include {SOFTSYNC_UC_PROFILE}")
+    created_at = payload.get("created_at")
+    if not isinstance(created_at, str) or not created_at.endswith("Z"):
+        errors.append(f"{path}: created_at must be a UTC ISO 8601 string ending in Z")
+    return errors
+
+
+def _validate_lifecycle(payload: Mapping[str, Any], *, path: str) -> list[str]:
+    lifecycle = payload.get("lifecycle")
+    if lifecycle is None:
+        return []
+    errors: list[str] = []
+    if not isinstance(lifecycle, Mapping):
+        return [f"{path}: lifecycle must be an object"]
+    if lifecycle.get("schema") != UC_CORE_LIFECYCLE_CONTRACT:
+        errors.append(f"{path}: lifecycle schema must be {UC_CORE_LIFECYCLE_CONTRACT}")
+    state = lifecycle.get("state")
+    if state not in {
+        "created",
+        "prepared",
+        "running",
+        "pausing",
+        "paused",
+        "closing",
+        "closed",
+        "cancelled",
+        "failed",
+    }:
+        errors.append(f"{path}: lifecycle state {state!r} is not a UC base state")
+    ended_unix_ns = lifecycle.get("ended_unix_ns")
+    if state in {"closed", "cancelled", "failed"} and not isinstance(ended_unix_ns, int):
+        errors.append(f"{path}: final lifecycle state requires ended_unix_ns")
+    closed_cleanly = lifecycle.get("closed_cleanly")
+    if closed_cleanly is True and state != "closed":
+        errors.append(f"{path}: closed_cleanly can be true only for closed lifecycle state")
+    return errors
+
+
+def _validation_report(
+    *,
+    validation_id: str,
+    subject: Mapping[str, Any],
+    errors: Sequence[str],
+    warnings: Sequence[str] = (),
+) -> dict[str, Any]:
+    created_unix_ns = time.time_ns()
+    return {
+        "schema": VALIDATION_SCHEMA,
+        **_uc_object_fields(
+            object_id=validation_id,
+            kind="test_run",
+            created_unix_ns=created_unix_ns,
+            contracts=VALIDATION_CONTRACTS,
+            command="validate",
+        ),
+        "subject": dict(subject),
+        "results": {
+            "status": "failed" if errors else "passed",
+            "pass_count": 0 if errors else 1,
+            "fail_count": len(errors),
+            "skip_count": 0,
+            "error_count": 0,
+        },
+        "errors": list(errors),
+        "warnings": list(warnings),
+        "conformance": {
+            "levels": ["shape", "portable"] if not errors else ["shape"],
+            "profile": SOFTSYNC_UC_PROFILE,
+        },
+    }
+
+
+def validate_uc_descriptors() -> dict[str, Any]:
+    """Validate packaged Universal Contracts descriptors for this distribution."""
+
+    errors: list[str] = []
+    package = "softsync.uc"
+    for filename in UC_DESCRIPTOR_FILES:
+        try:
+            resource = resources.files(package).joinpath(filename)
+            payload = json.loads(resource.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ModuleNotFoundError, json.JSONDecodeError, OSError) as exc:
+            errors.append(f"{filename}: cannot load descriptor: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            errors.append(f"{filename}: descriptor must be a JSON object")
+            continue
+        for field in ["schema", "id", "kind", "producer", "contracts"]:
+            if field not in payload:
+                errors.append(f"{filename}: missing field {field!r}")
+
+    schema_package = "softsync.uc.schemas"
+    for filename in UC_SCHEMA_FILES:
+        try:
+            resource = resources.files(schema_package).joinpath(filename)
+            payload = json.loads(resource.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ModuleNotFoundError, json.JSONDecodeError, OSError) as exc:
+            errors.append(f"schemas/{filename}: cannot load schema: {exc}")
+            continue
+        if not isinstance(payload, dict):
+            errors.append(f"schemas/{filename}: schema must be a JSON object")
+            continue
+        for field in ["$schema", "$id", "type"]:
+            if field not in payload:
+                errors.append(f"schemas/{filename}: missing field {field!r}")
+    return _validation_report(
+        validation_id="softsync:uc_descriptors",
+        subject={"kind": "package_descriptors", "package": package},
+        errors=errors,
+    )
 
 
 class _DirectoryWatcher:
@@ -646,14 +942,28 @@ class Coordinator:
         self.done_dir.mkdir(parents=True, exist_ok=True)
         if not self.session_file.exists():
             try:
+                created_at_monotonic_ns = time.monotonic_ns()
+                created_unix_ns = time.time_ns()
                 _atomic_write_json(
                     self.session_file,
                     {
                         "schema": SESSION_SCHEMA,
+                        **_uc_object_fields(
+                            object_id=self.sync_id,
+                            kind="softsync_session",
+                            created_unix_ns=created_unix_ns,
+                            contracts=SESSION_CONTRACTS,
+                        ),
                         "sync_id": self.sync_id,
                         "coordinator_id": self.coordinator_id,
-                        "created_at_monotonic_ns": time.monotonic_ns(),
-                        "created_at_unix_ns": time.time_ns(),
+                        "created_at_monotonic_ns": created_at_monotonic_ns,
+                        "created_at_unix_ns": created_unix_ns,
+                        "created_unix_ns": created_unix_ns,
+                        "lifecycle": _lifecycle(
+                            "created",
+                            created_unix_ns=created_unix_ns,
+                            closed_cleanly=None,
+                        ),
                         **_identity(),
                     },
                     overwrite=False,
@@ -691,11 +1001,21 @@ class Coordinator:
                 )
 
             configured_at_monotonic_ns = time.monotonic_ns()
+            configured_at_unix_ns = time.time_ns()
             condition: dict[str, Any] = {
                 "schema": START_CONDITION_SCHEMA,
+                **_uc_object_fields(
+                    object_id=f"{self.sync_id}:start_condition",
+                    kind="softsync_start_condition",
+                    created_unix_ns=configured_at_unix_ns,
+                    contracts=RUNTIME_CONTRACTS,
+                    command="prepare",
+                ),
                 "clock": "monotonic_ns",
                 "configured_at_monotonic_ns": configured_at_monotonic_ns,
-                "configured_at_unix_ns": time.time_ns(),
+                "configured_at_unix_ns": configured_at_unix_ns,
+                "timestamp_monotonic_ns": configured_at_monotonic_ns,
+                "timestamp_unix_ns": configured_at_unix_ns,
             }
             if delay_ns is not None:
                 condition["type"] = "delay_ns"
@@ -712,11 +1032,25 @@ class Coordinator:
             if client_ids is not None:
                 gate = {
                     "schema": READINESS_GATE_SCHEMA,
+                    **_uc_object_fields(
+                        object_id=f"{self.sync_id}:readiness_gate",
+                        kind="softsync_readiness_gate",
+                        created_unix_ns=configured_at_unix_ns,
+                        contracts=RUNTIME_CONTRACTS,
+                        command="prepare",
+                    ),
                     "wait_for_clients": sorted(client_ids),
                 }
             elif wait_for_N_clients is not None:
                 gate = {
                     "schema": READINESS_GATE_SCHEMA,
+                    **_uc_object_fields(
+                        object_id=f"{self.sync_id}:readiness_gate",
+                        kind="softsync_readiness_gate",
+                        created_unix_ns=configured_at_unix_ns,
+                        contracts=RUNTIME_CONTRACTS,
+                        command="prepare",
+                    ),
                     "wait_for_N_clients": int(wait_for_N_clients),
                 }
 
@@ -726,6 +1060,13 @@ class Coordinator:
                 session.pop("readiness_gate", None)
             else:
                 session["readiness_gate"] = gate
+            session["updated_at"] = _iso_utc_from_unix_ns(configured_at_unix_ns)
+            session["lifecycle"] = _session_lifecycle_from_existing(
+                session,
+                "prepared",
+                prepared_unix_ns=configured_at_unix_ns,
+                closed_cleanly=None,
+            )
             _write_session(self.session_file, session)
             return self.status()
 
@@ -746,6 +1087,15 @@ class Coordinator:
                     _fsync_dir(directory.parent)
             self._ensure_session()
             _clear_session_run_config(self.session_file)
+            reset_unix_ns = time.time_ns()
+            session = _read_session(self.session_file)
+            session["updated_at"] = _iso_utc_from_unix_ns(reset_unix_ns)
+            session["lifecycle"] = _session_lifecycle_from_existing(
+                session,
+                "created",
+                closed_cleanly=None,
+            )
+            _write_session(self.session_file, session)
 
     def _clear_report_files(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -903,6 +1253,17 @@ class Coordinator:
                 ),
             )
             _atomic_write_json(self.start_file, payload, overwrite=False)
+            session = _read_session(self.session_file)
+            issued_at_unix_ns = payload.get("issued_at_unix_ns")
+            if isinstance(issued_at_unix_ns, int):
+                session["updated_at"] = _iso_utc_from_unix_ns(issued_at_unix_ns)
+                session["lifecycle"] = _session_lifecycle_from_existing(
+                    session,
+                    "running",
+                    started_unix_ns=issued_at_unix_ns,
+                    closed_cleanly=None,
+                )
+                _write_session(self.session_file, session)
             return StartSignal.from_payload(payload, path=self.start_file)
 
     def cancel(
@@ -917,19 +1278,46 @@ class Coordinator:
                 raise SoftSyncStateError(f"{self.cancel_file} already exists")
             if self.stop_file.exists() and not overwrite:
                 raise SoftSyncStateError(f"{self.stop_file} already exists")
+            issued_at_monotonic_ns = time.monotonic_ns()
+            issued_at_unix_ns = time.time_ns()
             payload: dict[str, Any] = {
                 "schema": CANCEL_SCHEMA,
+                **_uc_object_fields(
+                    object_id=f"{self.sync_id}:cancel",
+                    kind="softsync_cancel_signal",
+                    created_unix_ns=issued_at_unix_ns,
+                    contracts=LIFECYCLE_SIGNAL_CONTRACTS,
+                    command="cancel",
+                ),
                 "command": "cancel",
                 "sync_id": self.sync_id,
                 "coordinator_id": self.coordinator_id,
                 "reason": reason,
-                "issued_at_monotonic_ns": time.monotonic_ns(),
-                "issued_at_unix_ns": time.time_ns(),
+                "issued_at_monotonic_ns": issued_at_monotonic_ns,
+                "issued_at_unix_ns": issued_at_unix_ns,
+                "timestamp_monotonic_ns": issued_at_monotonic_ns,
+                "timestamp_unix_ns": issued_at_unix_ns,
+                "lifecycle": _lifecycle(
+                    "cancelled",
+                    ended_unix_ns=issued_at_unix_ns,
+                    closed_cleanly=False,
+                    error={"message": reason} if reason else None,
+                ),
                 **_identity(),
             }
             if metadata:
                 payload["metadata"] = dict(metadata)
             _atomic_write_json(self.cancel_file, payload, overwrite=overwrite)
+            session = _read_session(self.session_file)
+            session["updated_at"] = _iso_utc_from_unix_ns(issued_at_unix_ns)
+            session["lifecycle"] = _session_lifecycle_from_existing(
+                session,
+                "cancelled",
+                ended_unix_ns=issued_at_unix_ns,
+                closed_cleanly=False,
+                error={"message": reason} if reason else None,
+            )
+            _write_session(self.session_file, session)
             self._cleanup_after_terminal()
             return payload
 
@@ -945,19 +1333,44 @@ class Coordinator:
                 raise SoftSyncStateError(f"{self.cancel_file} already exists")
             if self.stop_file.exists() and not overwrite:
                 raise SoftSyncStateError(f"{self.stop_file} already exists")
+            issued_at_monotonic_ns = time.monotonic_ns()
+            issued_at_unix_ns = time.time_ns()
             payload: dict[str, Any] = {
                 "schema": STOP_SCHEMA,
+                **_uc_object_fields(
+                    object_id=f"{self.sync_id}:stop",
+                    kind="softsync_stop_signal",
+                    created_unix_ns=issued_at_unix_ns,
+                    contracts=LIFECYCLE_SIGNAL_CONTRACTS,
+                    command="stop",
+                ),
                 "command": "stop",
                 "sync_id": self.sync_id,
                 "coordinator_id": self.coordinator_id,
                 "reason": reason,
-                "issued_at_monotonic_ns": time.monotonic_ns(),
-                "issued_at_unix_ns": time.time_ns(),
+                "issued_at_monotonic_ns": issued_at_monotonic_ns,
+                "issued_at_unix_ns": issued_at_unix_ns,
+                "timestamp_monotonic_ns": issued_at_monotonic_ns,
+                "timestamp_unix_ns": issued_at_unix_ns,
+                "lifecycle": _lifecycle(
+                    "closed",
+                    ended_unix_ns=issued_at_unix_ns,
+                    closed_cleanly=True,
+                ),
                 **_identity(),
             }
             if metadata:
                 payload["metadata"] = dict(metadata)
             _atomic_write_json(self.stop_file, payload, overwrite=overwrite)
+            session = _read_session(self.session_file)
+            session["updated_at"] = _iso_utc_from_unix_ns(issued_at_unix_ns)
+            session["lifecycle"] = _session_lifecycle_from_existing(
+                session,
+                "closed",
+                ended_unix_ns=issued_at_unix_ns,
+                closed_cleanly=True,
+            )
+            _write_session(self.session_file, session)
             self._cleanup_after_terminal()
             return payload
 
@@ -1036,9 +1449,11 @@ class Coordinator:
     def status(self) -> dict[str, Any]:
         if not self.path.exists():
             raise SoftSyncNotFound(f"{self.path} does not exist")
+        session = _read_session(self.session_file)
         return {
             "sync_id": self.sync_id,
             "path": str(self.path),
+            "lifecycle": session.get("lifecycle"),
             "start_condition": _read_session_start_condition(self.session_file),
             "readiness_gate": _read_session_readiness_gate(self.session_file),
             "waiting_for_clients": self.waiting_for_clients_file.exists(),
@@ -1047,6 +1462,80 @@ class Coordinator:
             "cancelled": self.cancel_file.exists(),
             "clients": self.get_clients(),
         }
+
+    def validate(self) -> dict[str, Any]:
+        if not self.path.exists():
+            raise SoftSyncNotFound(f"{self.path} does not exist")
+
+        errors: list[str] = []
+        file_specs = [
+            (self.session_file, SESSION_SCHEMA, "softsync_session"),
+            (
+                self.waiting_for_clients_file,
+                WAITING_FOR_CLIENTS_SCHEMA,
+                "softsync_readiness_request",
+            ),
+            (self.start_file, START_SCHEMA, "softsync_start_signal"),
+            (self.stop_file, STOP_SCHEMA, "softsync_stop_signal"),
+            (self.cancel_file, CANCEL_SCHEMA, "softsync_cancel_signal"),
+        ]
+        for path, expected_schema, expected_kind in file_specs:
+            if not path.exists():
+                continue
+            try:
+                payload = _read_json(path)
+            except (OSError, json.JSONDecodeError, SoftSyncError) as exc:
+                errors.append(f"{path}: cannot read JSON payload: {exc}")
+                continue
+            rel_path = str(path.relative_to(self.path))
+            errors.extend(
+                _validate_uc_payload(
+                    payload,
+                    path=rel_path,
+                    expected_schema=expected_schema,
+                    expected_kind=expected_kind,
+                )
+            )
+            errors.extend(_validate_lifecycle(payload, path=rel_path))
+
+        report_specs = [
+            (self.ready_dir, READY_SCHEMA),
+            (self.active_dir, ACTIVE_SCHEMA),
+            (self.done_dir, DONE_SCHEMA),
+        ]
+        for directory, expected_schema in report_specs:
+            if not directory.exists():
+                continue
+            for path in sorted(directory.glob("*.json")):
+                try:
+                    payload = _read_json(path)
+                except (OSError, json.JSONDecodeError, SoftSyncError) as exc:
+                    errors.append(f"{path}: cannot read JSON payload: {exc}")
+                    continue
+                rel_path = str(path.relative_to(self.path))
+                errors.extend(
+                    _validate_uc_payload(
+                        payload,
+                        path=rel_path,
+                        expected_schema=expected_schema,
+                        expected_kind="softsync_client_report",
+                    )
+                )
+                errors.extend(_validate_lifecycle(payload, path=rel_path))
+
+        if self.cancel_file.exists() and self.stop_file.exists():
+            errors.append("sync folder must not contain both cancel.json and stop.json")
+        if self.start_file.exists() and (self.cancel_file.exists() or self.stop_file.exists()):
+            errors.append("terminal sync folder must not retain start.json")
+        if self.cancel_file.exists() or self.stop_file.exists():
+            if any(self.ready_dir.glob("*.json")) or any(self.active_dir.glob("*.json")):
+                errors.append("terminal sync folder must not retain ready/active reports")
+
+        return _validation_report(
+            validation_id=f"{self.sync_id}:validation",
+            subject={"kind": "softsync_session", "sync_id": self.sync_id, "path": str(self.path)},
+            errors=errors,
+        )
 
 
 class Client:
@@ -1099,6 +1588,13 @@ class Client:
         if not self.path.is_dir():
             raise SoftSyncNotFound(f"{self.path} does not exist")
 
+    def _require_active_run(self) -> None:
+        self._require_sync_folder()
+        if self.cancel_file.exists():
+            raise SoftSyncStateError(f"{self.cancel_file} already exists")
+        if self.stop_file.exists():
+            raise SoftSyncStateError(f"{self.stop_file} already exists")
+
     def _wait_for_sync_folder(
         self,
         *,
@@ -1112,39 +1608,71 @@ class Client:
 
     def sync_ready(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self._require_sync_folder()
-        ready_at_monotonic_ns = time.monotonic_ns()
-        ready_at_unix_ns = time.time_ns()
-        payload: dict[str, Any] = {
-            "schema": READY_SCHEMA,
-            "sync_id": self.sync_id,
-            "client_id": self.client_id,
-            "state": "ready",
-            "ready_at_monotonic_ns": ready_at_monotonic_ns,
-            "ready_at_unix_ns": ready_at_unix_ns,
-            **_identity(),
-        }
-        if metadata:
-            payload["metadata"] = dict(metadata)
-        _atomic_write_json(self.ready_file, payload, create_parents=False)
-        return payload
+        with _sync_lifecycle_lock(self.root, self.sync_id):
+            self._require_active_run()
+            ready_at_monotonic_ns = time.monotonic_ns()
+            ready_at_unix_ns = time.time_ns()
+            payload: dict[str, Any] = {
+                "schema": READY_SCHEMA,
+                **_uc_object_fields(
+                    object_id=f"{self.sync_id}:ready:{self.client_id}",
+                    kind="softsync_client_report",
+                    created_unix_ns=ready_at_unix_ns,
+                    contracts=CLIENT_REPORT_CONTRACTS,
+                    command="ready",
+                ),
+                "sync_id": self.sync_id,
+                "client_id": self.client_id,
+                "state": "ready",
+                "ready_at_monotonic_ns": ready_at_monotonic_ns,
+                "ready_at_unix_ns": ready_at_unix_ns,
+                "timestamp_monotonic_ns": ready_at_monotonic_ns,
+                "timestamp_unix_ns": ready_at_unix_ns,
+                "lifecycle": _lifecycle(
+                    "prepared",
+                    prepared_unix_ns=ready_at_unix_ns,
+                    closed_cleanly=None,
+                ),
+                **_identity(),
+            }
+            if metadata:
+                payload["metadata"] = dict(metadata)
+            _atomic_write_json(self.ready_file, payload, create_parents=False)
+            return payload
 
     def sync_active(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self._require_sync_folder()
-        active_at_monotonic_ns = time.monotonic_ns()
-        active_at_unix_ns = time.time_ns()
-        payload: dict[str, Any] = {
-            "schema": ACTIVE_SCHEMA,
-            "sync_id": self.sync_id,
-            "client_id": self.client_id,
-            "state": "active",
-            "active_at_monotonic_ns": active_at_monotonic_ns,
-            "active_at_unix_ns": active_at_unix_ns,
-            **_identity(),
-        }
-        if metadata:
-            payload["metadata"] = dict(metadata)
-        _atomic_write_json(self.active_file, payload, create_parents=False)
-        return payload
+        with _sync_lifecycle_lock(self.root, self.sync_id):
+            self._require_active_run()
+            active_at_monotonic_ns = time.monotonic_ns()
+            active_at_unix_ns = time.time_ns()
+            payload: dict[str, Any] = {
+                "schema": ACTIVE_SCHEMA,
+                **_uc_object_fields(
+                    object_id=f"{self.sync_id}:active:{self.client_id}",
+                    kind="softsync_client_report",
+                    created_unix_ns=active_at_unix_ns,
+                    contracts=CLIENT_REPORT_CONTRACTS,
+                    command="active",
+                ),
+                "sync_id": self.sync_id,
+                "client_id": self.client_id,
+                "state": "active",
+                "active_at_monotonic_ns": active_at_monotonic_ns,
+                "active_at_unix_ns": active_at_unix_ns,
+                "timestamp_monotonic_ns": active_at_monotonic_ns,
+                "timestamp_unix_ns": active_at_unix_ns,
+                "lifecycle": _lifecycle(
+                    "running",
+                    started_unix_ns=active_at_unix_ns,
+                    closed_cleanly=None,
+                ),
+                **_identity(),
+            }
+            if metadata:
+                payload["metadata"] = dict(metadata)
+            _atomic_write_json(self.active_file, payload, create_parents=False)
+            return payload
 
     def wait_for_ready_request(
         self,
@@ -1226,13 +1754,29 @@ class Client:
 
     def sync_done(self, *, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self._require_sync_folder()
+        completed_at_monotonic_ns = time.monotonic_ns()
+        completed_at_unix_ns = time.time_ns()
         payload: dict[str, Any] = {
             "schema": DONE_SCHEMA,
+            **_uc_object_fields(
+                object_id=f"{self.sync_id}:done:{self.client_id}",
+                kind="softsync_client_report",
+                created_unix_ns=completed_at_unix_ns,
+                contracts=CLIENT_REPORT_CONTRACTS,
+                command="done",
+            ),
             "sync_id": self.sync_id,
             "client_id": self.client_id,
             "state": "done",
-            "completed_at_monotonic_ns": time.monotonic_ns(),
-            "completed_at_unix_ns": time.time_ns(),
+            "completed_at_monotonic_ns": completed_at_monotonic_ns,
+            "completed_at_unix_ns": completed_at_unix_ns,
+            "timestamp_monotonic_ns": completed_at_monotonic_ns,
+            "timestamp_unix_ns": completed_at_unix_ns,
+            "lifecycle": _lifecycle(
+                "closed",
+                ended_unix_ns=completed_at_unix_ns,
+                closed_cleanly=True,
+            ),
             **_identity(),
         }
         if metadata:
@@ -1253,6 +1797,10 @@ def coordinator(
 
 def remove(sync_id: str, *, root: str | os.PathLike[str] | None = None) -> None:
     Coordinator(sync_id, root=root, create=False).remove()
+
+
+def validate(sync_id: str, *, root: str | os.PathLike[str] | None = None) -> dict[str, Any]:
+    return Coordinator(sync_id, root=root, create=False).validate()
 
 
 def client(

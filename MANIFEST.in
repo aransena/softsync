@@ -1,7 +1,9 @@
 include README.md
 include LICENSE
+include project.json
 include pyproject.toml
 include setup.cfg
 include setup.py
+recursive-include src/softsync/uc *.json
 recursive-include examples *.md *.py
 recursive-include tests *.py

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from softsync import sync_client, sync_host
-from softsync.core import SoftSyncCancelled, SoftSyncError, SoftSyncTimeout
+from softsync.core import SoftSyncCancelled, SoftSyncError, SoftSyncTimeout, validate_uc_descriptors
 
 
 def _print_json(payload: Any) -> None:
@@ -94,6 +94,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="print sync status")
     status.add_argument("sync_id")
+
+    validate = subparsers.add_parser(
+        "validate",
+        help="validate packaged UC descriptors or one sync directory",
+    )
+    validate.add_argument("sync_id", nargs="?")
 
     reset = subparsers.add_parser("reset", help="clear run state for the named sync id")
     reset.add_argument("sync_id")
@@ -201,6 +207,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             _print_json(sync_host.status(args.sync_id, root=args.root))
             return 0
+
+        if args.command == "validate":
+            if args.sync_id:
+                payload = sync_host.validate(args.sync_id, root=args.root)
+            else:
+                payload = validate_uc_descriptors()
+            _print_json(payload)
+            return 0 if payload.get("results", {}).get("status") == "passed" else 1
 
         if args.command == "reset":
             sync_host.reset(args.sync_id, root=args.root)
